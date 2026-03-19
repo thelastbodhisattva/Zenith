@@ -520,6 +520,8 @@ export async function claimFees({ position_address }) {
     log("claim", `Claiming fees for position: ${position_address}`);
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+    // Clear cached pool so SDK loads fresh position fee state
+    poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
 
     const tx = await pool.claimSwapFee({
@@ -550,6 +552,8 @@ export async function closePosition({ position_address }) {
     log("close", `Closing position: ${position_address}`);
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+    // Clear cached pool so SDK loads fresh position fee state
+    poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
 
     const positionPubKey = new PublicKey(position_address);
