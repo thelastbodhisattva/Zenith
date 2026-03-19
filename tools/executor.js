@@ -178,6 +178,7 @@ const toolMap = {
     }
 
     if (Object.keys(applied).length === 0) {
+      log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`);
       return { success: false, unknown, reason };
     }
 
