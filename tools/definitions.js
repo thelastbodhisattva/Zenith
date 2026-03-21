@@ -123,6 +123,56 @@ Always call this before deploying a position to get the freshest price.`,
   {
     type: "function",
     function: {
+      name: "choose_distribution_strategy",
+      description: `Choose a deterministic DLMM distribution strategy from pool inputs and expected volume profile.
+Returns a code-driven recommendation using only supported strategy names: bid_ask or spot.
+Also returns lower/center/upper allocation guidance and the normalized inputs needed for the next planning step.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_data: {
+            type: "object",
+            description: "Pool snapshot for planning. Useful fields: six_hour_volatility or volatility, fee_tvl_ratio, organic_score, bin_step, price_change_pct, active_tvl, volume_24h."
+          },
+          expected_volume_profile: {
+            type: "string",
+            enum: ["low", "balanced", "high", "bursty"],
+            description: "Expected near-term volume regime. 'balanced' is the safe default when unsure."
+          }
+        },
+        required: ["pool_data", "expected_volume_profile"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "calculate_dynamic_bin_tiers",
+      description: `Build a deterministic 5-tier DLMM bin plan from 6h volatility and optional trend bias.
+The executable logic hard-clamps every side to a maximum of 34 bins.
+Returns lower, center, and upper tier metadata that can later drive live LP placement or re-entry logic.`,
+      parameters: {
+        type: "object",
+        properties: {
+          six_hour_volatility: {
+            type: "number",
+            description: "6h volatility input for planning. Higher values widen the bin plan up to the 34-bins-per-side hard cap."
+          },
+          trend_bias: {
+            type: "string",
+            enum: ["bearish", "neutral", "bullish"],
+            description: "Optional directional bias. Default neutral. Bullish shifts more bins and weight upward; bearish shifts downward."
+          }
+        },
+        required: ["six_hour_volatility"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "deploy_position",
       description: `Open a new DLMM liquidity position.
 
@@ -274,6 +324,82 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
           skip_swap: {
             type: "boolean",
             description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
+          }
+        },
+        required: ["position_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "rebalance_on_exit",
+      description: `Rebalance a position only when it is out of range.
+Builds a deterministic close + redeploy plan using choose_distribution_strategy and calculate_dynamic_bin_tiers.
+The bin planner keeps the 34-bins-per-side hard cap.
+
+Behavior:
+- If the position is still in range, it will skip unless force_rebalance=true.
+- In DRY_RUN it returns the full action plan and does not send transactions.
+- In live mode it fails safely if required state (position, wallet balances, deploy amounts) is missing.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to evaluate and rebalance"
+          },
+          force_rebalance: {
+            type: "boolean",
+            description: "Override in-range protection and force rebalance planning/execution. Default false."
+          },
+          expected_volume_profile: {
+            type: "string",
+            enum: ["low", "balanced", "high", "bursty"],
+            description: "Optional volume regime hint used by deterministic strategy planning."
+          },
+          execute: {
+            type: "boolean",
+            description: "Set false to return plan only in live mode. Default true."
+          }
+        },
+        required: ["position_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "auto_compound_fees",
+      description: `Claim fees and prepare a location-aware compounding plan for a position.
+Classifies active-bin location as near lower / center / upper and biases reinvestment accordingly:
+- near_lower -> base-heavy
+- near_center -> balanced
+- near_upper -> quote-heavy
+
+Uses deterministic helpers (choose_distribution_strategy + calculate_dynamic_bin_tiers) for planning.
+In DRY_RUN it returns claim + reinvest plans only. In live mode it claims first, then optionally opens an additional compounded position when execute_reinvest=true.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to claim and compound"
+          },
+          execute_reinvest: {
+            type: "boolean",
+            description: "If true, execute reinvest deployment after claiming fees. Default false (plan-only after claim)."
+          },
+          force_claim: {
+            type: "boolean",
+            description: "Attempt claim even when detected unclaimed fee amount is zero. Default false."
+          },
+          expected_volume_profile: {
+            type: "string",
+            enum: ["low", "balanced", "high", "bursty"],
+            description: "Optional volume regime hint used by deterministic strategy planning."
           }
         },
         required: ["position_address"]
@@ -625,6 +751,33 @@ Use this before deploying into a new pool to:
           limit: {
             type: "number",
             description: "Number of top LPers to study. Default 4."
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "score_top_lpers",
+      description: `Score top LP wallets for a pool using LP Agent as the primary source.
+Returns ranked wallet candidates with transparent component metrics for sample size, win rate, fee yield,
+capital efficiency, diversification, and recency. Persists the scored wallet snapshot into long-term memory.
+
+If Dune credentials/query IDs are configured, the tool adds a small optional bonus from Dune wallet enrichment.
+If Dune is unavailable or not configured, the tool still succeeds with LP Agent-only scoring.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "Pool address to score top LP wallets for"
+          },
+          limit: {
+            type: "number",
+            description: "Max wallets to score. Default 4 and capped to 4 to stay within LP Agent rate safety."
           }
         },
         required: ["pool_address"]

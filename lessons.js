@@ -64,15 +64,21 @@ export async function recordPerformance(perf) {
   const pnl_pct = perf.initial_value_usd > 0
     ? (pnl_usd / perf.initial_value_usd) * 100
     : 0;
+  const fee_yield_pct = perf.initial_value_usd > 0
+    ? (perf.fees_earned_usd / perf.initial_value_usd) * 100
+    : 0;
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
+  const tokenTypeDistribution = inferTokenTypeDistribution(perf);
 
   const entry = {
     ...perf,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
+    fee_yield_pct: Math.round(fee_yield_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
+    token_type_distribution: tokenTypeDistribution,
     recorded_at: new Date().toISOString(),
   };
 
@@ -102,6 +108,8 @@ export async function recordPerformance(perf) {
       close_reason: perf.close_reason,
       strategy: perf.strategy,
       volatility: perf.volatility,
+      fee_yield_pct: entry.fee_yield_pct,
+      token_type_distribution: tokenTypeDistribution.key,
     });
   }
 
@@ -117,6 +125,22 @@ export async function recordPerformance(perf) {
     }
   } catch (error) {
     log("memory", `Failed to mirror lesson into memory: ${error.message}`);
+  }
+
+  try {
+    const { rememberTokenTypeDistribution } = await import("./memory.js");
+    rememberTokenTypeDistribution({
+      distribution_key: tokenTypeDistribution.key,
+      strategy: perf.strategy || null,
+      pool_address: perf.pool || null,
+      pool_name: perf.pool_name || null,
+      pnl_pct: entry.pnl_pct,
+      fee_yield_pct: entry.fee_yield_pct,
+      minutes_held: perf.minutes_held ?? null,
+      success: entry.pnl_pct >= 0,
+    });
+  } catch (error) {
+    log("memory", `Failed to store distribution stats in memory: ${error.message}`);
   }
 
   // Evolve thresholds every 5 closed positions
@@ -161,19 +185,19 @@ function derivLesson(perf) {
   if (outcome === "good" || outcome === "bad") {
     if (perf.range_efficiency < 30 && outcome === "bad") {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
-      tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
+      tags.push("oor", perf.strategy, perf.token_type_distribution?.key, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
       rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
-      tags.push("efficient", perf.strategy);
+      tags.push("efficient", perf.strategy, perf.token_type_distribution?.key);
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
       rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
       tags.push("volume_collapse");
     } else if (outcome === "good") {
       rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
-      tags.push("worked");
+      tags.push("worked", perf.token_type_distribution?.key);
     } else {
       rule = `FAILED: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
-      tags.push("failed");
+      tags.push("failed", perf.token_type_distribution?.key);
     }
   }
 
@@ -352,7 +376,7 @@ export function evolveThresholds(perfData, config) {
 // ─── Helpers ───────────────────────────────────────────────────
 
 function isFiniteNum(n) {
-  return typeof n === "number" && isFinite(n);
+  return typeof n === "number" && Number.isFinite(n);
 }
 
 function avg(arr) {
@@ -561,7 +585,9 @@ export function getLessonsForPrompt(opts = {}) {
     .sort(byPriority)
     .slice(0, ROLE_CAP);
 
-  roleMatched.forEach((l) => usedIds.add(l.id));
+  roleMatched.forEach((l) => {
+    usedIds.add(l.id);
+  });
 
   // ── Tier 3: Recent fill ─────────────────────────────────────────
   const remainingBudget = RECENT_CAP - pinned.length - roleMatched.length;
@@ -656,5 +682,55 @@ export function getPerformanceSummary() {
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
     win_rate_pct: Math.round((wins / p.length) * 100),
     total_lessons: data.lessons.length,
+    token_type_distribution_success_rates: summarizeTokenTypeDistributions(p),
   };
+}
+
+function inferTokenTypeDistribution(perf) {
+  const strategy = String(perf.strategy || "").toLowerCase();
+
+  if (strategy === "bid_ask") {
+    return {
+      key: "quote_heavy",
+      label: "quote-heavy",
+      source: "strategy",
+    };
+  }
+
+  if (strategy === "spot" || strategy === "curve") {
+    return {
+      key: "balanced",
+      label: "balanced",
+      source: "strategy",
+    };
+  }
+
+  return {
+    key: "unknown",
+    label: "unknown",
+    source: "strategy",
+  };
+}
+
+function summarizeTokenTypeDistributions(performance) {
+  const grouped = {};
+
+  for (const row of performance) {
+    const key = row.token_type_distribution?.key || "unknown";
+    if (!grouped[key]) {
+      grouped[key] = { total_closed: 0, wins: 0, avg_pnl_pct: 0 };
+    }
+
+    grouped[key].total_closed += 1;
+    if ((row.pnl_pct ?? 0) >= 0) grouped[key].wins += 1;
+    grouped[key].avg_pnl_pct = ((grouped[key].avg_pnl_pct * (grouped[key].total_closed - 1)) + (row.pnl_pct ?? 0)) / grouped[key].total_closed;
+  }
+
+  return Object.fromEntries(
+    Object.entries(grouped).map(([key, stats]) => ([key, {
+      total_closed: stats.total_closed,
+      win_rate_pct: Math.round((stats.wins / stats.total_closed) * 100),
+      avg_pnl_pct: Math.round(stats.avg_pnl_pct * 100) / 100,
+    }]))
+  );
 }

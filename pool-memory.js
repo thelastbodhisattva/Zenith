@@ -10,6 +10,76 @@ import { log } from "./logger.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
 
+function createPoolEntry(name, baseMint = null) {
+  return {
+    name,
+    base_mint: baseMint,
+    deploys: [],
+    total_deploys: 0,
+    avg_pnl_pct: 0,
+    win_rate: 0,
+    last_deployed_at: null,
+    last_outcome: null,
+    notes: [],
+    snapshots: [],
+    token_type_distribution_stats: {},
+  };
+}
+
+function ensurePoolEntry(db, poolAddress, seed = {}) {
+  if (!db[poolAddress]) {
+    db[poolAddress] = createPoolEntry(seed.name || poolAddress.slice(0, 8), seed.base_mint || null);
+  }
+
+  if (!db[poolAddress].notes) db[poolAddress].notes = [];
+  if (!db[poolAddress].deploys) db[poolAddress].deploys = [];
+  if (!db[poolAddress].snapshots) db[poolAddress].snapshots = [];
+  if (!db[poolAddress].token_type_distribution_stats) db[poolAddress].token_type_distribution_stats = {};
+  if (!db[poolAddress].name) db[poolAddress].name = seed.name || poolAddress.slice(0, 8);
+  if (!db[poolAddress].base_mint && seed.base_mint) db[poolAddress].base_mint = seed.base_mint;
+  return db[poolAddress];
+}
+
+function round(value, decimals = 2) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+
+function updateTokenTypeDistributionStats(entry, deploy) {
+  const key = deploy.token_type_distribution;
+  if (!key) return;
+
+  const stats = entry.token_type_distribution_stats[key] || {
+    distribution_key: key,
+    total_closed: 0,
+    wins: 0,
+    losses: 0,
+    avg_pnl_pct: 0,
+    avg_fee_yield_pct: 0,
+    last_outcome: null,
+    last_recorded_at: null,
+  };
+
+  stats.total_closed += 1;
+  if ((deploy.pnl_pct ?? 0) >= 0) stats.wins += 1;
+  else stats.losses += 1;
+
+  if (typeof deploy.pnl_pct === "number" && Number.isFinite(deploy.pnl_pct)) {
+    stats.avg_pnl_pct = round(((stats.avg_pnl_pct || 0) * (stats.total_closed - 1) + deploy.pnl_pct) / stats.total_closed, 2);
+  }
+
+  if (typeof deploy.fee_yield_pct === "number" && Number.isFinite(deploy.fee_yield_pct)) {
+    stats.avg_fee_yield_pct = round(((stats.avg_fee_yield_pct || 0) * (stats.total_closed - 1) + deploy.fee_yield_pct) / stats.total_closed, 2);
+  }
+
+  stats.win_rate = round((stats.wins / stats.total_closed) * 100, 2);
+  stats.last_outcome = (deploy.pnl_pct ?? 0) >= 0 ? "profit" : "loss";
+  stats.last_recorded_at = deploy.closed_at || new Date().toISOString();
+
+  entry.token_type_distribution_stats[key] = stats;
+}
+
 function load() {
   if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
   try {
@@ -42,27 +112,17 @@ function save(data) {
  * @param {string} deployData.close_reason
  * @param {string} deployData.strategy
  * @param {number} deployData.volatility
+ * @param {number} deployData.fee_yield_pct
+ * @param {string} deployData.token_type_distribution
  */
 export function recordPoolDeploy(poolAddress, deployData) {
   if (!poolAddress) return;
 
   const db = load();
-
-  if (!db[poolAddress]) {
-    db[poolAddress] = {
-      name: deployData.pool_name || poolAddress.slice(0, 8),
-      base_mint: deployData.base_mint || null,
-      deploys: [],
-      total_deploys: 0,
-      avg_pnl_pct: 0,
-      win_rate: 0,
-      last_deployed_at: null,
-      last_outcome: null,
-      notes: [],
-    };
-  }
-
-  const entry = db[poolAddress];
+  const entry = ensurePoolEntry(db, poolAddress, {
+    name: deployData.pool_name || poolAddress.slice(0, 8),
+    base_mint: deployData.base_mint || null,
+  });
 
   const deploy = {
     deployed_at: deployData.deployed_at || null,
@@ -74,6 +134,8 @@ export function recordPoolDeploy(poolAddress, deployData) {
     close_reason: deployData.close_reason || null,
     strategy: deployData.strategy || null,
     volatility_at_deploy: deployData.volatility ?? null,
+    fee_yield_pct: deployData.fee_yield_pct ?? null,
+    token_type_distribution: deployData.token_type_distribution || null,
   };
 
   entry.deploys.push(deploy);
@@ -95,6 +157,8 @@ export function recordPoolDeploy(poolAddress, deployData) {
   if (deployData.base_mint && !entry.base_mint) {
     entry.base_mint = deployData.base_mint;
   }
+
+  updateTokenTypeDistributionStats(entry, deploy);
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
@@ -131,6 +195,7 @@ export function getPoolMemory({ pool_address }) {
     last_deployed_at: entry.last_deployed_at,
     last_outcome: entry.last_outcome,
     notes: entry.notes,
+    token_type_distribution_stats: entry.token_type_distribution_stats || {},
     history: entry.deploys.slice(-10), // last 10 deploys
   };
 }
@@ -143,25 +208,11 @@ export function getPoolMemory({ pool_address }) {
 export function recordPositionSnapshot(poolAddress, snapshot) {
   if (!poolAddress) return;
   const db = load();
+  const entry = ensurePoolEntry(db, poolAddress, {
+    name: snapshot.pair || poolAddress.slice(0, 8),
+  });
 
-  if (!db[poolAddress]) {
-    db[poolAddress] = {
-      name: snapshot.pair || poolAddress.slice(0, 8),
-      base_mint: null,
-      deploys: [],
-      total_deploys: 0,
-      avg_pnl_pct: 0,
-      win_rate: 0,
-      last_deployed_at: null,
-      last_outcome: null,
-      notes: [],
-      snapshots: [],
-    };
-  }
-
-  if (!db[poolAddress].snapshots) db[poolAddress].snapshots = [];
-
-  db[poolAddress].snapshots.push({
+  entry.snapshots.push({
     ts: new Date().toISOString(),
     position: snapshot.position,
     pnl_pct: snapshot.pnl_pct ?? null,
@@ -173,8 +224,8 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
   });
 
   // Keep last 48 snapshots (~4h at 5min intervals)
-  if (db[poolAddress].snapshots.length > 48) {
-    db[poolAddress].snapshots = db[poolAddress].snapshots.slice(-48);
+  if (entry.snapshots.length > 48) {
+    entry.snapshots = entry.snapshots.slice(-48);
   }
 
   save(db);
@@ -215,6 +266,13 @@ export function recallForPool(poolAddress) {
     lines.push(`NOTE: ${lastNote.note}`);
   }
 
+  const distributionStats = Object.values(entry.token_type_distribution_stats || {})
+    .sort((a, b) => (b.total_closed || 0) - (a.total_closed || 0));
+  if (distributionStats.length > 0) {
+    const best = distributionStats[0];
+    lines.push(`DISTRIBUTION MEMORY: ${best.distribution_key} win rate ${best.win_rate}% over ${best.total_closed} close(s), avg PnL ${best.avg_pnl_pct}%`);
+  }
+
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
@@ -227,22 +285,11 @@ export function addPoolNote({ pool_address, note }) {
   if (!note) return { error: "note required" };
 
   const db = load();
+  const entry = ensurePoolEntry(db, pool_address, {
+    name: pool_address.slice(0, 8),
+  });
 
-  if (!db[pool_address]) {
-    db[pool_address] = {
-      name: pool_address.slice(0, 8),
-      base_mint: null,
-      deploys: [],
-      total_deploys: 0,
-      avg_pnl_pct: 0,
-      win_rate: 0,
-      last_deployed_at: null,
-      last_outcome: null,
-      notes: [],
-    };
-  }
-
-  db[pool_address].notes.push({
+  entry.notes.push({
     note,
     added_at: new Date().toISOString(),
   });

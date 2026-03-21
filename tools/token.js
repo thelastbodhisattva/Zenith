@@ -115,7 +115,13 @@ export async function getTokenHolders({ mint, limit = 20 }) {
   const funderGroups = {};
   for (const h of realHolders) {
     if (h.funding?.address) {
-      (funderGroups[h.funding.address] ||= []).push(h.address);
+      const key = h.funding.address;
+      let group = funderGroups[key];
+      if (!group) {
+        group = [];
+        funderGroups[key] = group;
+      }
+      group.push(h.address);
     }
   }
   const commonFunderSet = new Set(
@@ -167,7 +173,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
   // Use targeted holders endpoint — only returns matching wallets, no noise
   const { listSmartWallets } = await import("../smart-wallets.js");
   const { wallets: smartWallets } = listSmartWallets();
-  let smartWalletsHolding = [];
+  const smartWalletsHolding = [];
 
   if (smartWallets.length > 0) {
     const addresses = smartWallets.map((w) => w.address).join(",");

@@ -8,7 +8,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
+import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
@@ -24,7 +24,6 @@ log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
 
 initMemory();
 
-const TP_PCT  = config.management.takeProfitFeePct;
 const DEPLOY  = config.management.deployAmountSol;
 
 // ═══════════════════════════════════════════
@@ -46,6 +45,156 @@ function formatCountdown(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function asNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function deriveExpectedVolumeProfile(snapshot = {}) {
+  const feeTvlRatio = asNumber(snapshot.fee_active_tvl_ratio ?? snapshot.fee_tvl_ratio, 0);
+  const volume = asNumber(snapshot.volume_window ?? snapshot.volume_24h, 0);
+  const volatility = asNumber(snapshot.six_hour_volatility ?? snapshot.volatility, 0);
+
+  if (volatility >= 18 || volume >= 250_000 || feeTvlRatio >= 1.5) return "bursty";
+  if (volatility >= 10 || volume >= 75_000 || feeTvlRatio >= 0.5) return "high";
+  if (volume >= Math.max(config.screening.minVolume * 8, 10_000) || feeTvlRatio >= 0.12) return "balanced";
+  return "low";
+}
+
+function deriveTrendBias(pool = {}, tokenInfo = null) {
+  const priceChange = asNumber(
+    tokenInfo?.stats_1h?.price_change ?? pool.price_change_pct ?? pool.price_change_1h,
+    0
+  );
+
+  if (priceChange >= 5) return "bullish";
+  if (priceChange <= -5) return "bearish";
+  return "neutral";
+}
+
+function summarizeRuntimeActionResult(result) {
+  if (!result) return "no result returned";
+  if (result.blocked) return `blocked - ${result.reason || "safety check failed"}`;
+  if (result.error) return `error - ${result.error}`;
+  if (result.skipped) return `skipped - ${result.reason || "not needed"}`;
+  if (result.rebalanced) return `rebalanced into ${result.new_position}`;
+  if (result.claimed && result.compounded === false) return result.message || "fees claimed; reinvest left as plan-only";
+  if (result.executed === false && result.message) return result.message;
+  if (result.success) return result.message || "completed successfully";
+  return "completed";
+}
+
+function didRuntimeHandleManagementAction(result) {
+  return Boolean(
+    result
+    && !result.blocked
+    && !result.error
+    && !result.skipped
+    && result.success !== false
+  );
+}
+
+function formatLpWalletScore(scoreResult) {
+  if (!scoreResult) return "fetch failed";
+  if (scoreResult.message && (!scoreResult.candidates || scoreResult.candidates.length === 0)) return scoreResult.message;
+
+  const ranked = (scoreResult.candidates || []).slice(0, 2);
+  if (ranked.length === 0) return "no credible LP wallets scored";
+
+  return ranked.map((wallet, index) => {
+    const rank = index + 1;
+    const name = wallet.short_owner || wallet.owner || `wallet_${rank}`;
+    const totalScore = asNumber(wallet.score_breakdown?.total_score, 0).toFixed(1);
+    const winRate = asNumber(wallet.metrics?.win_rate_pct, 0).toFixed(1);
+    const feeYield = asNumber(wallet.metrics?.fee_yield_pct_of_capital, 0).toFixed(1);
+    const sample = asNumber(wallet.metrics?.sampled_history_count ?? wallet.metrics?.total_lp, 0);
+    return `#${rank} ${name} score=${totalScore}, win=${winRate}%, fee_yield=${feeYield}%, sample=${sample}`;
+  }).join(" | ");
+}
+
+function formatPlannerContext(distributionPlan, tierPlan) {
+  if (!distributionPlan?.strategy) return "planner unavailable";
+
+  const dist = distributionPlan.distribution_plan || {};
+  const tiers = tierPlan?.range_plan || {};
+  const alloc = [dist.lower_allocation, dist.center_allocation, dist.upper_allocation]
+    .map((value) => asNumber(value, 0).toFixed(2))
+    .join("/");
+
+  return [
+    `strategy=${distributionPlan.strategy}`,
+    `volume_profile=${distributionPlan.expected_volume_profile}`,
+    `trend=${distributionPlan.next_step_inputs?.trend_bias || "neutral"}`,
+    `token_bias=${dist.token_bias || "balanced"}`,
+    `alloc=${alloc}`,
+    `bins=${asNumber(tiers.bins_below, 0)}/${asNumber(tiers.bins_above, 0)}`,
+  ].join(" | ");
+}
+
+function shouldSkipManagedRuntimeAction(position) {
+  const pnlPct = Number.isFinite(Number(position.pnl?.pnl_pct ?? position.pnl_pct))
+    ? Number(position.pnl?.pnl_pct ?? position.pnl_pct)
+    : null;
+
+  return Boolean(
+    position.instruction
+    || position.exitAlert
+    || (pnlPct != null && pnlPct <= config.management.emergencyPriceDropPct)
+    || (pnlPct != null && pnlPct >= config.management.takeProfitFeePct)
+  );
+}
+
+async function runManagementRuntimeActions(positionData) {
+  const runtimeActions = [];
+
+  for (const position of positionData) {
+    if (shouldSkipManagedRuntimeAction(position)) continue;
+
+    const feesUsd = asNumber(position.pnl?.unclaimed_fee_usd ?? position.unclaimed_fees_usd, 0);
+    const oorMinutes = asNumber(position.minutes_out_of_range, 0);
+    const expectedVolumeProfile = deriveExpectedVolumeProfile({
+      fee_tvl_ratio: position.fee_tvl_ratio,
+      volatility: position.pnl?.volatility ?? position.volatility,
+      volume_window: position.volume_window,
+    });
+
+    let toolName = null;
+    let args = null;
+    let reason = null;
+
+    if (position.in_range === false) {
+      toolName = "rebalance_on_exit";
+      args = {
+        position_address: position.position,
+        execute: true,
+        expected_volume_profile: expectedVolumeProfile,
+      };
+      reason = oorMinutes > 0 ? `out of range for ${oorMinutes}m` : "out of range";
+    } else if (feesUsd >= config.management.minClaimAmount) {
+      toolName = "auto_compound_fees";
+      args = {
+        position_address: position.position,
+        execute_reinvest: false,
+        expected_volume_profile: expectedVolumeProfile,
+      };
+      reason = `fees $${feesUsd.toFixed(2)} >= $${config.management.minClaimAmount}`;
+    }
+
+    if (!toolName) continue;
+
+    const result = await executeTool(toolName, args);
+    runtimeActions.push({
+      position: position.position,
+      pair: position.pair,
+      toolName,
+      reason,
+      result,
+    });
+  }
+
+  return runtimeActions;
 }
 
 function buildPrompt() {
@@ -139,13 +288,33 @@ export function startCronJobs() {
         return { ...enriched, pnl, recall, memoryRecall, exitAlert };
       }));
 
-      const exitAlerts = positionData
+      const runtimeActions = await runManagementRuntimeActions(positionData);
+      const handledRuntimeActions = runtimeActions.filter((action) => didRuntimeHandleManagementAction(action.result));
+      const attemptedRuntimeActions = runtimeActions.filter((action) => !didRuntimeHandleManagementAction(action.result));
+      const handledRuntimeActionMap = new Map(handledRuntimeActions.map((action) => [action.position, action]));
+      const attemptedRuntimeActionMap = new Map(attemptedRuntimeActions.map((action) => [action.position, action]));
+      const pendingPositionData = positionData.filter((p) => !handledRuntimeActionMap.has(p.position));
+      const pendingExitAlerts = pendingPositionData
         .filter((p) => p.exitAlert)
         .map((p) => `- ${p.pair}: ${p.exitAlert}`);
 
+      const handledRuntimeActionBlock = handledRuntimeActions.length > 0
+        ? handledRuntimeActions.map((action) => {
+          const outcome = summarizeRuntimeActionResult(action.result);
+          return `- ${action.pair} (${action.position}): ${action.toolName} [${action.reason}] -> ${outcome}`;
+        }).join("\n")
+        : "- none";
+      const attemptedRuntimeActionBlock = attemptedRuntimeActions.length > 0
+        ? attemptedRuntimeActions.map((action) => {
+          const outcome = summarizeRuntimeActionResult(action.result);
+          return `- ${action.pair} (${action.position}): ${action.toolName} [${action.reason}] -> ${outcome}`;
+        }).join("\n")
+        : "- none";
+
       // Build pre-loaded position blocks for the LLM
-      const positionBlocks = positionData.map((p) => {
+      const positionBlocks = pendingPositionData.map((p) => {
         const pnl = p.pnl;
+        const runtimeAttempt = attemptedRuntimeActionMap.get(p.position);
         const lines = [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
@@ -153,42 +322,59 @@ export function startCronJobs() {
           pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd}` : `  pnl: fetch failed`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
           p.exitAlert ? `  exit_alert: ${p.exitAlert}` : null,
+          runtimeAttempt ? `  runtime_attempt_this_cycle: ${runtimeAttempt.toolName} -> ${summarizeRuntimeActionResult(runtimeAttempt.result)}` : null,
           p.recall ? `  pool_memory: ${p.recall}` : null,
           p.memoryRecall ? `  learned_memory: ${p.memoryRecall}` : null,
         ].filter(Boolean);
         return lines.join("\n");
       }).join("\n\n");
 
+      if (pendingPositionData.length === 0) {
+        mgmtReport = `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nNo remaining positions required manager write decisions this cycle.`;
+        return;
+      }
+
       const { content } = await agentLoop(`
-MANAGEMENT CYCLE — ${positions.length} position(s)
+MANAGEMENT CYCLE — ${positions.length} position(s), ${pendingPositionData.length} still actionable after runtime orchestration
+
+RUNTIME ACTIONS ALREADY EXECUTED THIS CYCLE (do not repeat any write action for these positions):
+${handledRuntimeActionBlock}
+
+RUNTIME WRITE ATTEMPTS THAT DID NOT COMPLETE (do not retry the same tool on these positions this cycle unless the user explicitly instructs it):
+${attemptedRuntimeActionBlock}
 
 PRE-LOADED POSITION DATA (no fetching needed):
 ${positionBlocks}
 
-${exitAlerts.length ? `AUTOMATIC EXIT ALERTS (highest priority — close these immediately):
-${exitAlerts.join("\n")}
+${pendingExitAlerts.length ? `AUTOMATIC EXIT ALERTS (highest priority — close these immediately):
+${pendingExitAlerts.join("\n")}
 
 ` : ""}HARD CLOSE RULES — apply in order, first match wins:
 1. instruction set AND condition met → CLOSE (highest priority)
 2. instruction set AND condition NOT met → HOLD, skip remaining rules
 3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
 4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-5. oor_minutes >= ${config.management.outOfRangeWaitMinutes} → CLOSE (OOR timeout)
+5. in_range = false → REBALANCE with rebalance_on_exit immediately, unless a higher-priority close rule already fired
 6. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio} AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
 
-CLAIM RULE: If unclaimed_fee_usd >= ${config.management.minClaimAmount}, call claim_fees. Do not use any other threshold.
+CLAIM RULE: If a position is staying open and unclaimed_fee_usd >= ${config.management.minClaimAmount}, use auto_compound_fees with execute_reinvest=false. Do not call claim_fees directly unless auto_compound_fees is unavailable.
 
 INSTRUCTIONS:
 All data is pre-loaded above — do NOT call get_my_positions or get_position_pnl.
 Apply the rules to each position and write your report immediately.
-Only call tools if a position needs to be CLOSED or fees need to be CLAIMED.
+Never repeat a write action for any position already listed in RUNTIME ACTIONS ALREADY EXECUTED.
+If a position shows runtime_attempt_this_cycle, do not retry that same tool again this cycle. You may still choose a different action or report why no further action is safe.
+Only call tools if a remaining position needs to be CLOSED, REBALANCED, or fees need safe-mode compounding.
+If you use auto_compound_fees, keep execute_reinvest=false because in-place compounding is still blocked; safe mode claims fees and returns a non-executed reinvest plan.
 If all positions STAY and no fees to claim, just write the report with no tool calls.
 
 REPORT FORMAT (one per position):
 **[PAIR]** | Age: [X]m | Unclaimed: $[X] | Claimed: $[X] | PnL: [X]%
-**Rule:** [number or "none"] | **Decision:** STAY/CLOSE | **Reason:** [1 sentence]
+**Rule:** [number or "none"] | **Decision:** STAY/CLOSE/REBALANCE/COMPOUND | **Reason:** [1 sentence]
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096);
-      mgmtReport = content;
+      mgmtReport = runtimeActions.length > 0
+        ? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\n${content}`
+        : content;
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
@@ -246,15 +432,41 @@ REPORT FORMAT (one per position):
       const topCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
       const candidates = topCandidates?.candidates || topCandidates?.pools || [];
 
+      const scorePreloadLimit = Math.min(2, candidates.length);
+      const preloadedLpScores = new Map();
+      for (const pool of candidates.slice(0, scorePreloadLimit)) {
+        const scoreResult = await executeTool("score_top_lpers", { pool_address: pool.pool, limit: 4 });
+        preloadedLpScores.set(pool.pool, scoreResult);
+      }
+
       const candidateBlocks = await Promise.all(
         candidates.slice(0, 5).map(async (pool) => {
           const mint = pool.base?.mint;
-          const [smartWallets, holders, narrative, tokenInfo, poolMemory] = await Promise.allSettled([
+          const planningPoolData = {
+            six_hour_volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
+            volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
+            fee_tvl_ratio: asNumber(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio, 0),
+            organic_score: asNumber(pool.organic_score, 0),
+            bin_step: asNumber(pool.bin_step, 0),
+            price_change_pct: asNumber(pool.price_change_pct, 0),
+            active_tvl: asNumber(pool.active_tvl, 0),
+            volume_24h: asNumber(pool.volume_24h ?? pool.volume_window, 0),
+          };
+          const expectedVolumeProfile = deriveExpectedVolumeProfile(pool);
+          const [smartWallets, holders, narrative, tokenInfo, poolMemory, distributionPlan, tierPlan] = await Promise.allSettled([
             checkSmartWalletsOnPool({ pool_address: pool.pool }),
             mint ? getTokenHolders({ mint, limit: 10 }) : Promise.resolve(null),
             mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
             mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
             Promise.resolve(recallForPool(pool.pool)),
+            executeTool("choose_distribution_strategy", {
+              pool_data: planningPoolData,
+              expected_volume_profile: expectedVolumeProfile,
+            }),
+            executeTool("calculate_dynamic_bin_tiers", {
+              six_hour_volatility: planningPoolData.six_hour_volatility,
+              trend_bias: deriveTrendBias(pool),
+            }),
           ]);
 
           const sw   = smartWallets.status === "fulfilled" ? smartWallets.value : null;
@@ -262,6 +474,12 @@ REPORT FORMAT (one per position):
           const n    = narrative.status === "fulfilled" ? narrative.value : null;
           const ti   = tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null;
           const mem  = poolMemory.value;
+          const scoredLpers = preloadedLpScores.get(pool.pool) || {
+            message: `not preloaded (rate-safe budget reserved for top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}; fetch only if decisive)`,
+            candidates: [],
+          };
+          const planner = distributionPlan.status === "fulfilled" ? distributionPlan.value : null;
+          const tiering = tierPlan.status === "fulfilled" ? tierPlan.value : null;
           const memoryHits = recallForScreening({
             name: pool.name,
             pair: pool.name,
@@ -284,6 +502,8 @@ REPORT FORMAT (one per position):
             h ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}` : `  holders: fetch failed`,
             momentum ? `  momentum: ${momentum}` : null,
             n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
+            `  lp_wallet_scoring: ${formatLpWalletScore(scoredLpers)}`,
+            `  planner: ${formatPlannerContext(planner, tiering)}`,
             mem ? `  pool_memory: ${mem}` : null,
             learnedMemory ? `  learned_memory: ${learnedMemory}` : null,
           ].filter(Boolean);
@@ -293,7 +513,7 @@ REPORT FORMAT (one per position):
       );
 
       const candidateContext = candidateBlocks.length > 0
-        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative already fetched):\n${candidateBlocks.join("\n\n")}\n`
+        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative, planner context, and conservative LP-wallet scoring for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}):\n${candidateBlocks.join("\n\n")}\n`
         : "";
 
       const { content } = await agentLoop(`
@@ -307,12 +527,17 @@ DECISION RULES (apply to the pre-loaded candidates above, no re-fetching needed)
 - SKIP if narrative is empty/null or pure hype with no specific story (unless smart wallets present)
 - Bundlers 5–15% are normal, not a skip reason on their own
 - Smart wallets present → strong confidence boost
+- LP-wallet scoring matters: prefer pools where top scored LPs show real win rate, fee yield, and sample depth
+- Use the pre-loaded planner context to bias strategy/range choices before deploy; only override it if a candidate has a clear contradictory signal
+- LP-wallet scoring preload is conservative and rate-aware. It is only preloaded for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}; for later candidates, only fetch score_top_lpers if the cheaper signals already make that pool a serious finalist.
 
 STEPS:
 1. Pick the best candidate from the pre-loaded analysis above. If none pass, report why and stop.
-2. deploy_position directly — it fetches the active bin internally, no separate get_active_bin needed.
+2. Reuse the pre-loaded LP-wallet scoring and planner context in your reasoning. Do not call choose_distribution_strategy or calculate_dynamic_bin_tiers again unless a candidate block explicitly failed to load and the missing data is decisive.
+3. Only call score_top_lpers for a later candidate if that pool is already a leading deploy option after the cheaper pre-loaded signals and its LP-wallet score would break the tie.
+4. deploy_position directly — it fetches the active bin internally, no separate get_active_bin needed.
    Use ${deployAmount} SOL. Do NOT use a smaller amount — this is compounded from your ${currentBalance.sol.toFixed(3)} SOL wallet.
-3. Report: pool chosen, key signals, deploy outcome.
+5. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096);
       screenReport = content;
     } catch (error) {

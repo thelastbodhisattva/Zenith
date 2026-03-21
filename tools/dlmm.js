@@ -14,12 +14,13 @@ import {
   markInRange,
   recordClaim,
   recordClose,
+  recordRebalance,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { normalizeMint } from "./wallet.js";
+import { getWalletBalances, normalizeMint } from "./wallet.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -64,6 +65,314 @@ function getWallet() {
 // ─── Pool Cache ────────────────────────────────────────────────
 const poolCache = new Map();
 
+const MAX_BINS_PER_SIDE = 34;
+const MIN_BINS_PER_SIDE = 6;
+
+function toFiniteNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampWholeNumber(value, min, max) {
+  return Math.round(clampNumber(toFiniteNumber(value, min), min, max));
+}
+
+function roundMetric(value, decimals = 4) {
+  const factor = Math.pow(10, decimals);
+  return Math.round(value * factor) / factor;
+}
+
+function normalizeExpectedVolumeProfile(profile) {
+  const normalized = String(profile || "balanced").trim().toLowerCase();
+  const profileMap = {
+    low: "low",
+    light: "low",
+    thin: "low",
+    balanced: "balanced",
+    moderate: "balanced",
+    normal: "balanced",
+    medium: "balanced",
+    high: "high",
+    heavy: "high",
+    strong: "high",
+    bursty: "bursty",
+    spiky: "bursty",
+    surge: "bursty",
+    surging: "bursty",
+  };
+  return profileMap[normalized] || "balanced";
+}
+
+function normalizeTrendBias(trendBias) {
+  if (typeof trendBias === "number") {
+    const value = clampNumber(trendBias, -1, 1);
+    return {
+      label: value >= 0.25 ? "bullish" : value <= -0.25 ? "bearish" : "neutral",
+      value,
+    };
+  }
+
+  const normalized = String(trendBias || "neutral").trim().toLowerCase();
+  const trendMap = {
+    bullish: 0.75,
+    bull: 0.75,
+    up: 0.75,
+    uptrend: 0.75,
+    bearish: -0.75,
+    bear: -0.75,
+    down: -0.75,
+    downtrend: -0.75,
+    neutral: 0,
+    flat: 0,
+    sideways: 0,
+    range: 0,
+  };
+  const value = trendMap[normalized] ?? 0;
+  return {
+    label: value >= 0.25 ? "bullish" : value <= -0.25 ? "bearish" : "neutral",
+    value,
+  };
+}
+
+function normalizeWeights(weights) {
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  if (total <= 0) {
+    return weights.map(() => roundMetric(1 / weights.length));
+  }
+  return weights.map((weight) => roundMetric(weight / total));
+}
+
+function splitIntegerByWeights(total, weights) {
+  if (total <= 0) return weights.map(() => 0);
+
+  const normalizedWeights = normalizeWeights(weights);
+  const positiveIndexes = normalizedWeights
+    .map((weight, index) => (weight > 0 ? index : -1))
+    .filter((index) => index >= 0);
+  const guaranteed = total >= positiveIndexes.length ? 1 : 0;
+  const segments = normalizedWeights.map((weight) => (weight > 0 ? guaranteed : 0));
+  let remaining = total - segments.reduce((sum, segment) => sum + segment, 0);
+
+  if (remaining <= 0) {
+    return segments;
+  }
+
+  const rawAllocations = normalizedWeights.map((weight, index) => ({
+    index,
+    raw: weight * remaining,
+  }));
+
+  for (const allocation of rawAllocations) {
+    const whole = Math.floor(allocation.raw);
+    segments[allocation.index] += whole;
+    remaining -= whole;
+    allocation.fraction = allocation.raw - whole;
+  }
+
+  rawAllocations
+    .sort((a, b) => (b.fraction || 0) - (a.fraction || 0))
+    .slice(0, remaining)
+    .forEach(({ index }) => {
+      segments[index] += 1;
+    });
+
+  return segments;
+}
+
+function resolveSideBinTarget(sixHourVolatility) {
+  const volatility = Math.max(0, toFiniteNumber(sixHourVolatility, 0));
+  if (volatility <= 2) return 10;
+  if (volatility <= 4) return 12;
+  if (volatility <= 8) return 16;
+  if (volatility <= 12) return 20;
+  if (volatility <= 18) return 24;
+  if (volatility <= 25) return 30;
+  return MAX_BINS_PER_SIDE;
+}
+
+function resolveTierSplitWeights(sixHourVolatility) {
+  const volatility = Math.max(0, toFiniteNumber(sixHourVolatility, 0));
+  if (volatility <= 6) return { outer: 0.2, inner: 0.25, center: 0.55 };
+  if (volatility <= 12) return { outer: 0.22, inner: 0.28, center: 0.5 };
+  if (volatility <= 18) return { outer: 0.24, inner: 0.3, center: 0.46 };
+  if (volatility <= 25) return { outer: 0.26, inner: 0.31, center: 0.43 };
+  return { outer: 0.28, inner: 0.32, center: 0.4 };
+}
+
+function normalizePoolPlanningInputs(poolData = {}) {
+  return {
+    volatility: Math.max(
+      0,
+      toFiniteNumber(poolData.six_hour_volatility ?? poolData.volatility_6h ?? poolData.volatility, 0)
+    ),
+    feeTvlRatio: Math.max(0, toFiniteNumber(poolData.fee_tvl_ratio ?? poolData.feeActiveTvlRatio, 0)),
+    organicScore: Math.max(0, toFiniteNumber(poolData.organic_score ?? poolData.organic, 0)),
+    binStep: Math.max(0, toFiniteNumber(poolData.bin_step, 0)),
+    priceChangePct: toFiniteNumber(
+      poolData.price_change_pct ?? poolData.priceChangePct ?? poolData.price_change_24h,
+      0
+    ),
+    activeTvl: Math.max(0, toFiniteNumber(poolData.active_tvl ?? poolData.tvl ?? poolData.liquidity, 0)),
+    volume24h: Math.max(0, toFiniteNumber(poolData.volume_24h ?? poolData.trade_volume_24h, 0)),
+  };
+}
+
+function buildDistributionWeights(strategy, volumeProfile, priceChangePct) {
+  const inferredTrend = normalizeTrendBias(clampNumber(priceChangePct / 20, -1, 1));
+
+  if (strategy === "bid_ask") {
+    const lowerWeight = 0.68 - Math.max(0, inferredTrend.value) * 0.08 + Math.max(0, -inferredTrend.value) * 0.06;
+    const centerWeight = volumeProfile === "bursty" ? 0.36 : volumeProfile === "high" ? 0.34 : 0.32;
+    const normalized = normalizeWeights([lowerWeight, centerWeight, 0]);
+    return {
+      lower: normalized[0],
+      center: normalized[1],
+      upper: normalized[2],
+      tokenBias: "quote_heavy",
+      activeBinTreatment: "defensive",
+      inferredTrend,
+    };
+  }
+
+  let lowerWeight = 0.24;
+  const centerWeight = volumeProfile === "high" ? 0.56 : volumeProfile === "bursty" ? 0.48 : 0.52;
+  let upperWeight = 0.24;
+
+  if (inferredTrend.value > 0) {
+    const shift = 0.08 * inferredTrend.value;
+    lowerWeight -= shift;
+    upperWeight += shift;
+  } else if (inferredTrend.value < 0) {
+    const shift = 0.08 * Math.abs(inferredTrend.value);
+    lowerWeight += shift;
+    upperWeight -= shift;
+  }
+
+  const normalized = normalizeWeights([lowerWeight, centerWeight, upperWeight]);
+  return {
+    lower: normalized[0],
+    center: normalized[1],
+    upper: normalized[2],
+    tokenBias: "balanced",
+    activeBinTreatment: volumeProfile === "bursty" ? "buffered" : "balanced",
+    inferredTrend,
+  };
+}
+
+function buildTierRange(side, startOffset, endOffset, binsBelow, binsAbove, includesActiveBin = false) {
+  return {
+    side,
+    start_offset: startOffset,
+    end_offset: endOffset,
+    bins_below: clampWholeNumber(binsBelow, 0, MAX_BINS_PER_SIDE),
+    bins_above: clampWholeNumber(binsAbove, 0, MAX_BINS_PER_SIDE),
+    includes_active_bin: includesActiveBin,
+  };
+}
+
+function buildDynamicBinTierPlan(sixHourVolatility, trendBias = "neutral") {
+  const normalizedVolatility = Math.max(0, toFiniteNumber(sixHourVolatility, 0));
+  const normalizedTrend = normalizeTrendBias(trendBias);
+  const baseSideBins = resolveSideBinTarget(normalizedVolatility);
+  const lowerMultiplier = normalizedTrend.value < 0
+    ? 1 + Math.abs(normalizedTrend.value) * 0.25
+    : 1 - normalizedTrend.value * 0.15;
+  const upperMultiplier = normalizedTrend.value > 0
+    ? 1 + normalizedTrend.value * 0.25
+    : 1 - Math.abs(normalizedTrend.value) * 0.15;
+
+  const lowerTotal = clampWholeNumber(baseSideBins * lowerMultiplier, MIN_BINS_PER_SIDE, MAX_BINS_PER_SIDE);
+  const upperTotal = clampWholeNumber(baseSideBins * upperMultiplier, MIN_BINS_PER_SIDE, MAX_BINS_PER_SIDE);
+  const splitWeights = resolveTierSplitWeights(normalizedVolatility);
+
+  const [lowerOuterBins, lowerInnerBins, centerLowerBins] = splitIntegerByWeights(lowerTotal, [
+    splitWeights.outer,
+    splitWeights.inner,
+    splitWeights.center,
+  ]);
+  const [centerUpperBins, upperInnerBins, upperOuterBins] = splitIntegerByWeights(upperTotal, [
+    splitWeights.center,
+    splitWeights.inner,
+    splitWeights.outer,
+  ]);
+
+  const lowerSideAllocation = 0.34 - normalizedTrend.value * 0.1;
+  const upperSideAllocation = 0.34 + normalizedTrend.value * 0.1;
+  const [lowerOuterWeight, lowerInnerWeight, centerWeight, upperInnerWeight, upperOuterWeight] = normalizeWeights([
+    lowerSideAllocation * 0.35,
+    lowerSideAllocation * 0.65,
+    0.32,
+    upperSideAllocation * 0.65,
+    upperSideAllocation * 0.35,
+  ]);
+
+  const centerStart = centerLowerBins > 0 ? -centerLowerBins : 0;
+  const centerEnd = centerUpperBins > 0 ? centerUpperBins : 0;
+  const lowerInnerStart = -(centerLowerBins + lowerInnerBins);
+  const lowerInnerEnd = -(centerLowerBins + 1);
+  const lowerOuterEnd = -(centerLowerBins + lowerInnerBins + 1);
+  const upperInnerStart = centerUpperBins + 1;
+  const upperInnerEnd = centerUpperBins + upperInnerBins;
+  const upperOuterStart = centerUpperBins + upperInnerBins + 1;
+
+  const tiers = [
+    {
+      id: "lower_outer",
+      label: "Lower Outer",
+      allocation_weight: lowerOuterWeight,
+      ...buildTierRange("lower", -lowerTotal, lowerOuterEnd, lowerOuterBins, 0),
+    },
+    {
+      id: "lower_inner",
+      label: "Lower Inner",
+      allocation_weight: lowerInnerWeight,
+      ...buildTierRange("lower", lowerInnerStart, lowerInnerEnd, lowerInnerBins, 0),
+    },
+    {
+      id: "center",
+      label: "Center",
+      allocation_weight: centerWeight,
+      ...buildTierRange("center", centerStart, centerEnd, centerLowerBins, centerUpperBins, true),
+    },
+    {
+      id: "upper_inner",
+      label: "Upper Inner",
+      allocation_weight: upperInnerWeight,
+      ...buildTierRange("upper", upperInnerStart, upperInnerEnd, 0, upperInnerBins),
+    },
+    {
+      id: "upper_outer",
+      label: "Upper Outer",
+      allocation_weight: upperOuterWeight,
+      ...buildTierRange("upper", upperOuterStart, upperTotal, 0, upperOuterBins),
+    },
+  ];
+
+  return {
+    six_hour_volatility: roundMetric(normalizedVolatility, 2),
+    trend_bias: normalizedTrend.label,
+    trend_bias_score: roundMetric(normalizedTrend.value, 2),
+    max_bins_per_side: MAX_BINS_PER_SIDE,
+    range_plan: {
+      bins_below: lowerTotal,
+      bins_above: upperTotal,
+      total_bins: lowerTotal + upperTotal,
+      center_bin_included: true,
+      hard_clamped: lowerTotal === MAX_BINS_PER_SIDE || upperTotal === MAX_BINS_PER_SIDE,
+    },
+    distribution_weights: {
+      lower: roundMetric(lowerOuterWeight + lowerInnerWeight),
+      center: centerWeight,
+      upper: roundMetric(upperInnerWeight + upperOuterWeight),
+    },
+    tiers,
+  };
+}
+
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
   if (!poolCache.has(key)) {
@@ -87,6 +396,99 @@ export async function getActiveBin({ pool_address }) {
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
   };
+}
+
+export async function chooseDistributionStrategy({ pool_data = {}, expected_volume_profile = "balanced" }) {
+  const poolData = normalizePoolPlanningInputs(pool_data);
+  const volumeProfile = normalizeExpectedVolumeProfile(expected_volume_profile);
+
+  let spotScore = 0;
+  let bidAskScore = 0;
+
+  if (volumeProfile === "high") spotScore += 2;
+  if (volumeProfile === "balanced") {
+    spotScore += 1;
+    bidAskScore += 1;
+  }
+  if (volumeProfile === "low") bidAskScore += 2;
+  if (volumeProfile === "bursty") bidAskScore += 2;
+
+  if (poolData.volatility >= 18) bidAskScore += 2;
+  else if (poolData.volatility >= 10) {
+    bidAskScore += 1;
+    spotScore += 1;
+  } else {
+    spotScore += 2;
+  }
+
+  if (Math.abs(poolData.priceChangePct) >= 15) bidAskScore += 2;
+  else if (Math.abs(poolData.priceChangePct) >= 8) bidAskScore += 1;
+  else spotScore += 1;
+
+  if (poolData.feeTvlRatio >= 0.08) spotScore += 2;
+  else if (poolData.feeTvlRatio >= 0.04) {
+    spotScore += 1;
+    bidAskScore += 1;
+  } else {
+    bidAskScore += 1;
+  }
+
+  if (poolData.binStep >= 110) bidAskScore += 1;
+  else if (poolData.binStep > 0 && poolData.binStep <= 90) spotScore += 1;
+
+  if (poolData.organicScore >= 80) spotScore += 1;
+  else if (poolData.organicScore > 0 && poolData.organicScore < 65) bidAskScore += 1;
+
+  if (poolData.activeTvl >= 100000) spotScore += 1;
+  else if (poolData.activeTvl > 0 && poolData.activeTvl < 25000) bidAskScore += 1;
+
+  const strategy = spotScore > bidAskScore
+    ? "spot"
+    : bidAskScore > spotScore
+      ? "bid_ask"
+      : volumeProfile === "high" || volumeProfile === "balanced"
+        ? "spot"
+        : "bid_ask";
+
+  const distribution = buildDistributionWeights(strategy, volumeProfile, poolData.priceChangePct);
+
+  return {
+    strategy,
+    expected_volume_profile: volumeProfile,
+    strategy_scores: {
+      bid_ask: bidAskScore,
+      spot: spotScore,
+    },
+    distribution_plan: {
+      lower_allocation: distribution.lower,
+      center_allocation: distribution.center,
+      upper_allocation: distribution.upper,
+      lower_enabled: true,
+      center_enabled: true,
+      upper_enabled: strategy === "spot",
+      token_bias: distribution.tokenBias,
+      active_bin_treatment: distribution.activeBinTreatment,
+    },
+    pool_snapshot: {
+      volatility: roundMetric(poolData.volatility, 2),
+      fee_tvl_ratio: roundMetric(poolData.feeTvlRatio, 4),
+      organic_score: roundMetric(poolData.organicScore, 2),
+      bin_step: poolData.binStep,
+      price_change_pct: roundMetric(poolData.priceChangePct, 2),
+      active_tvl: roundMetric(poolData.activeTvl, 2),
+      volume_24h: roundMetric(poolData.volume24h, 2),
+    },
+    next_step_inputs: {
+      six_hour_volatility: roundMetric(poolData.volatility, 2),
+      trend_bias: distribution.inferredTrend.label,
+      max_bins_per_side: MAX_BINS_PER_SIDE,
+    },
+    supported_strategies: ["bid_ask", "spot"],
+  };
+}
+
+export async function calculateDynamicBinTiers({ six_hour_volatility, trend_bias = "neutral" }) {
+  return buildDynamicBinTierPlan(six_hour_volatility, trend_bias);
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
@@ -533,6 +935,786 @@ export async function searchPools({ query, limit = 10 }) {
       token_x: { symbol: p.mint_x_symbol ?? p.token_x?.symbol, mint: p.mint_x ?? p.token_x?.address },
       token_y: { symbol: p.mint_y_symbol ?? p.token_y?.symbol, mint: p.mint_y ?? p.token_y?.address },
     })),
+  };
+}
+
+function toNullableFiniteNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function resolveExpectedVolumeProfile(feeTvlRatio) {
+  const ratio = Math.max(0, toFiniteNumber(feeTvlRatio, 0));
+  if (ratio >= 0.08) return "high";
+  if (ratio >= 0.03) return "balanced";
+  if (ratio <= 0.01) return "low";
+  return "balanced";
+}
+
+function inferTrendBiasFromBins(lowerBin, upperBin, activeBin) {
+  if (!Number.isFinite(lowerBin) || !Number.isFinite(upperBin) || !Number.isFinite(activeBin)) {
+    return "neutral";
+  }
+  if (activeBin > upperBin) return "bullish";
+  if (activeBin < lowerBin) return "bearish";
+
+  const span = upperBin - lowerBin;
+  if (span <= 0) return "neutral";
+  const ratio = (activeBin - lowerBin) / span;
+  if (ratio >= 0.6) return "bullish";
+  if (ratio <= 0.4) return "bearish";
+  return "neutral";
+}
+
+function classifyRangeLocation({ lowerBin, upperBin, activeBin }) {
+  if (!Number.isFinite(lowerBin) || !Number.isFinite(upperBin) || !Number.isFinite(activeBin)) {
+    return {
+      location: "unknown",
+      in_range: null,
+      normalized_position: null,
+      distance_to_lower_bins: null,
+      distance_to_upper_bins: null,
+    };
+  }
+
+  if (upperBin <= lowerBin) {
+    return {
+      location: "unknown",
+      in_range: null,
+      normalized_position: null,
+      distance_to_lower_bins: null,
+      distance_to_upper_bins: null,
+    };
+  }
+
+  if (activeBin < lowerBin) {
+    return {
+      location: "out_below",
+      in_range: false,
+      normalized_position: roundMetric((activeBin - lowerBin) / (upperBin - lowerBin), 4),
+      distance_to_lower_bins: activeBin - lowerBin,
+      distance_to_upper_bins: upperBin - activeBin,
+    };
+  }
+
+  if (activeBin > upperBin) {
+    return {
+      location: "out_above",
+      in_range: false,
+      normalized_position: roundMetric((activeBin - lowerBin) / (upperBin - lowerBin), 4),
+      distance_to_lower_bins: activeBin - lowerBin,
+      distance_to_upper_bins: upperBin - activeBin,
+    };
+  }
+
+  const span = upperBin - lowerBin;
+  const ratio = (activeBin - lowerBin) / span;
+  const location = ratio <= 0.33 ? "near_lower" : ratio >= 0.67 ? "near_upper" : "near_center";
+
+  return {
+    location,
+    in_range: true,
+    normalized_position: roundMetric(ratio, 4),
+    distance_to_lower_bins: activeBin - lowerBin,
+    distance_to_upper_bins: upperBin - activeBin,
+  };
+}
+
+function roundAmount(value, decimals = 6) {
+  const sanitized = Math.max(0, toFiniteNumber(value, 0));
+  const factor = Math.pow(10, decimals);
+  return Math.floor(sanitized * factor) / factor;
+}
+
+function findTokenBalanceByMint(walletBalances, mint) {
+  if (!mint || !walletBalances || !Array.isArray(walletBalances.tokens)) return null;
+  const normalizedMint = normalizeMint(mint);
+  return walletBalances.tokens.find((token) => normalizeMint(token.mint) === normalizedMint) || null;
+}
+
+function getWalletBalanceByMint(walletBalances, mint) {
+  const normalizedMint = normalizeMint(mint);
+  if (normalizedMint === config.tokens.SOL) {
+    return toNullableFiniteNumber(walletBalances?.sol);
+  }
+
+  const token = findTokenBalanceByMint(walletBalances, normalizedMint);
+  if (!token) return 0;
+  return toNullableFiniteNumber(token.balance);
+}
+
+async function captureBalanceSnapshotForMints({ token_x_mint, token_y_mint, phase }) {
+  const balances = await getWalletBalances();
+  if (balances?.error) {
+    return {
+      error: `Unable to load wallet balances ${phase}: ${balances.error}`,
+    };
+  }
+
+  const tokenXAmount = getWalletBalanceByMint(balances, token_x_mint);
+  const tokenYAmount = getWalletBalanceByMint(balances, token_y_mint);
+
+  if (tokenXAmount == null || tokenYAmount == null) {
+    return {
+      error: `Unable to read token balances ${phase} for pool token mints`,
+    };
+  }
+
+  return {
+    token_x_mint: normalizeMint(token_x_mint),
+    token_y_mint: normalizeMint(token_y_mint),
+    amount_x: tokenXAmount,
+    amount_y: tokenYAmount,
+    sampled_at: new Date().toISOString(),
+  };
+}
+
+function calculateBalanceDeltas(beforeSnapshot, afterSnapshot) {
+  if (!beforeSnapshot || !afterSnapshot) {
+    return { error: "Cannot compute balance deltas without before/after snapshots" };
+  }
+
+  const deltaXRaw = toNullableFiniteNumber(afterSnapshot.amount_x - beforeSnapshot.amount_x);
+  const deltaYRaw = toNullableFiniteNumber(afterSnapshot.amount_y - beforeSnapshot.amount_y);
+
+  if (deltaXRaw == null || deltaYRaw == null) {
+    return { error: "Computed non-finite balance deltas" };
+  }
+
+  const amountX = roundAmount(Math.max(0, deltaXRaw), 6);
+  const amountY = roundAmount(Math.max(0, deltaYRaw), 6);
+
+  if (amountX <= 0 && amountY <= 0) {
+    return {
+      error: "No positive recovered token deltas detected after close",
+      delta_x_raw: roundMetric(deltaXRaw, 8),
+      delta_y_raw: roundMetric(deltaYRaw, 8),
+    };
+  }
+
+  return {
+    amount_x: amountX,
+    amount_y: amountY,
+    delta_x_raw: roundMetric(deltaXRaw, 8),
+    delta_y_raw: roundMetric(deltaYRaw, 8),
+  };
+}
+
+function resolveBinSnapshot(position, pnl) {
+  const lowerBin = toNullableFiniteNumber(pnl?.lower_bin) ?? toNullableFiniteNumber(position?.lower_bin);
+  const upperBin = toNullableFiniteNumber(pnl?.upper_bin) ?? toNullableFiniteNumber(position?.upper_bin);
+  const activeBin = toNullableFiniteNumber(pnl?.active_bin) ?? toNullableFiniteNumber(position?.active_bin);
+  const inRange = typeof pnl?.in_range === "boolean"
+    ? pnl.in_range
+    : typeof position?.in_range === "boolean"
+      ? position.in_range
+      : null;
+
+  return { lowerBin, upperBin, activeBin, inRange };
+}
+
+function buildPoolPlanningData(position, binSnapshot) {
+  const observedWidth = Number.isFinite(binSnapshot.lowerBin) && Number.isFinite(binSnapshot.upperBin)
+    ? Math.max(2, Math.abs(binSnapshot.upperBin - binSnapshot.lowerBin) / 3)
+    : 8;
+
+  const sixHourVolatility = roundMetric(
+    Math.max(0, toFiniteNumber(position?.volatility, observedWidth)),
+    2
+  );
+  const trendBias = inferTrendBiasFromBins(binSnapshot.lowerBin, binSnapshot.upperBin, binSnapshot.activeBin);
+  const syntheticPriceChange = trendBias === "bullish" ? 12 : trendBias === "bearish" ? -12 : 0;
+  const feeTvlRatio = Math.max(0, toFiniteNumber(position?.fee_tvl_ratio, 0));
+
+  return {
+    pool_data: {
+      six_hour_volatility: sixHourVolatility,
+      fee_tvl_ratio: feeTvlRatio,
+      organic_score: Math.max(0, toFiniteNumber(position?.organic_score, 0)),
+      bin_step: Math.max(0, toFiniteNumber(position?.bin_step, 0)),
+      price_change_pct: syntheticPriceChange,
+      active_tvl: Math.max(0, toFiniteNumber(position?.total_value_usd, 0)),
+      volume_24h: Math.max(0, toFiniteNumber(position?.volume_24h, 0)),
+    },
+    trend_bias: trendBias,
+    expected_volume_profile: resolveExpectedVolumeProfile(feeTvlRatio),
+  };
+}
+
+async function resolvePoolTokenMints(poolAddress) {
+  if (!poolAddress) return null;
+  try {
+    const pool = await getPool(poolAddress);
+    return {
+      token_x_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+      token_y_mint: pool?.lbPair?.tokenYMint?.toString() || null,
+    };
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+function buildTrackedPositionFallback(position_address) {
+  const tracked = getTrackedPosition(position_address);
+  if (!tracked || tracked.closed) return null;
+
+  return {
+    position: tracked.position,
+    pool: tracked.pool,
+    pair: tracked.pool_name || tracked.pool?.slice(0, 8) || null,
+    pool_name: tracked.pool_name || null,
+    strategy: tracked.strategy || null,
+    bin_step: tracked.bin_step ?? null,
+    volatility: tracked.volatility ?? null,
+    fee_tvl_ratio: tracked.fee_tvl_ratio ?? null,
+    organic_score: tracked.organic_score ?? null,
+    lower_bin: tracked.bin_range?.min ?? null,
+    upper_bin: tracked.bin_range?.max ?? null,
+    active_bin: tracked.active_bin_at_deploy ?? null,
+    in_range: tracked.out_of_range_since ? false : true,
+    unclaimed_fees_usd: 0,
+    total_value_usd: tracked.initial_value_usd ?? 0,
+    source: "state_fallback",
+  };
+}
+
+async function getPositionExecutionContext(position_address) {
+  const isDryRun = process.env.DRY_RUN === "true";
+  const positionsResult = await getMyPositions({ force: true });
+  if (positionsResult?.error) {
+    if (isDryRun) {
+      const fallbackPosition = buildTrackedPositionFallback(position_address);
+      if (fallbackPosition) {
+        const binSnapshot = resolveBinSnapshot(fallbackPosition, null);
+        const rangeLocation = classifyRangeLocation(binSnapshot);
+        return {
+          position: fallbackPosition,
+          pnl: null,
+          bin_snapshot: binSnapshot,
+          range_location: rangeLocation,
+          in_range: binSnapshot.inRange,
+          context_source: "state_fallback",
+        };
+      }
+    }
+    return {
+      error: `Unable to load open positions: ${positionsResult.error}`,
+      positions: positionsResult.positions || [],
+    };
+  }
+
+  const position = (positionsResult.positions || []).find((item) => item.position === position_address);
+  if (!position) {
+    if (isDryRun) {
+      const fallbackPosition = buildTrackedPositionFallback(position_address);
+      if (fallbackPosition) {
+        const binSnapshot = resolveBinSnapshot(fallbackPosition, null);
+        const rangeLocation = classifyRangeLocation(binSnapshot);
+        return {
+          position: fallbackPosition,
+          pnl: null,
+          bin_snapshot: binSnapshot,
+          range_location: rangeLocation,
+          in_range: binSnapshot.inRange,
+          context_source: "state_fallback",
+        };
+      }
+    }
+    return {
+      error: `Position ${position_address} was not found in open positions`,
+      positions: positionsResult.positions || [],
+    };
+  }
+
+  let pnl = null;
+  try {
+    pnl = await getPositionPnl({ pool_address: position.pool, position_address });
+  } catch (error) {
+    pnl = { error: error.message };
+  }
+
+  const binSnapshot = resolveBinSnapshot(position, pnl);
+  const rangeLocation = classifyRangeLocation(binSnapshot);
+
+  return {
+    position,
+    pnl,
+    bin_snapshot: binSnapshot,
+    range_location: rangeLocation,
+    in_range: binSnapshot.inRange,
+  };
+}
+
+export async function rebalanceOnExit({
+  position_address,
+  force_rebalance = false,
+  expected_volume_profile,
+  execute = true,
+} = {}) {
+  position_address = normalizeMint(position_address);
+  if (!position_address) {
+    return { success: false, error: "position_address is required" };
+  }
+
+  const context = await getPositionExecutionContext(position_address);
+  if (context.error) {
+    return { success: false, error: context.error, position: position_address };
+  }
+
+  const outOfRange = context.in_range === false || context.range_location.in_range === false;
+  if (!outOfRange && !force_rebalance) {
+    return {
+      success: false,
+      skipped: true,
+      position: position_address,
+      reason: "Position is currently in range. Set force_rebalance=true to override.",
+      range_snapshot: context.bin_snapshot,
+      range_location: context.range_location,
+    };
+  }
+
+  const planningData = buildPoolPlanningData(context.position, context.bin_snapshot);
+  const expectedVolumeProfile = expected_volume_profile || planningData.expected_volume_profile;
+  const distributionPlan = await chooseDistributionStrategy({
+    pool_data: planningData.pool_data,
+    expected_volume_profile: expectedVolumeProfile,
+  });
+  const tierPlan = await calculateDynamicBinTiers({
+    six_hour_volatility: planningData.pool_data.six_hour_volatility,
+    trend_bias: planningData.trend_bias,
+  });
+
+  const strategy = distributionPlan?.strategy || context.position.strategy || config.strategy.strategy;
+  const binsBelow = clampWholeNumber(
+    tierPlan?.range_plan?.bins_below ?? config.strategy.binsBelow,
+    0,
+    MAX_BINS_PER_SIDE
+  );
+  const binsAbove = strategy === "bid_ask"
+    ? 0
+    : clampWholeNumber(tierPlan?.range_plan?.bins_above ?? 0, 0, MAX_BINS_PER_SIDE);
+
+  const actionPlan = {
+    close_position: { position_address },
+    deploy_position: {
+      pool_address: context.position.pool,
+      pool_name: context.position.pool_name || context.position.pair || null,
+      strategy,
+      bins_below: binsBelow,
+      bins_above: binsAbove,
+      amount_x: null,
+      amount_y: null,
+      amount_source: "post_close_balance_delta",
+      bin_step: context.position.bin_step ?? null,
+      volatility: planningData.pool_data.six_hour_volatility,
+      fee_tvl_ratio: planningData.pool_data.fee_tvl_ratio,
+      organic_score: planningData.pool_data.organic_score,
+    },
+  };
+
+  const dryRun = process.env.DRY_RUN === "true";
+  if (dryRun || !execute) {
+    return {
+      success: true,
+      dry_run: dryRun,
+      executed: false,
+      position: position_address,
+      out_of_range: outOfRange,
+      force_rebalance: !!force_rebalance,
+      range_snapshot: context.bin_snapshot,
+      range_location: context.range_location,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          note: "Live execution redeploy amount is derived only from close balance deltas.",
+        },
+      },
+      action_plan: actionPlan,
+      message: dryRun
+        ? "DRY RUN — rebalance plan generated, no transactions sent"
+        : "Execution disabled — rebalance plan generated",
+    };
+  }
+
+  if (!context.position.pool) {
+    return {
+      success: false,
+      error: "Cannot execute live rebalance without a pool address",
+      position: position_address,
+      action_plan: actionPlan,
+    };
+  }
+
+  const poolTokenMints = await resolvePoolTokenMints(context.position.pool);
+  if (!poolTokenMints || poolTokenMints.error || !poolTokenMints.token_x_mint || !poolTokenMints.token_y_mint) {
+    return {
+      success: false,
+      error: `Cannot execute live rebalance without pool token mint metadata${poolTokenMints?.error ? `: ${poolTokenMints.error}` : ""}`,
+      position: position_address,
+      action_plan: actionPlan,
+    };
+  }
+
+  const beforeCloseSnapshot = await captureBalanceSnapshotForMints({
+    token_x_mint: poolTokenMints.token_x_mint,
+    token_y_mint: poolTokenMints.token_y_mint,
+    phase: "before close",
+  });
+  if (beforeCloseSnapshot?.error) {
+    return {
+      success: false,
+      error: `Cannot execute live rebalance without a pre-close balance snapshot: ${beforeCloseSnapshot.error}`,
+      position: position_address,
+      action_plan: actionPlan,
+    };
+  }
+
+  const closeResult = await closePosition({ position_address });
+  if (!closeResult?.success) {
+    return {
+      success: false,
+      error: closeResult?.error || "Failed to close position for rebalance",
+      position: position_address,
+      close_result: closeResult,
+      action_plan: actionPlan,
+    };
+  }
+
+  const afterCloseSnapshot = await captureBalanceSnapshotForMints({
+    token_x_mint: poolTokenMints.token_x_mint,
+    token_y_mint: poolTokenMints.token_y_mint,
+    phase: "after close",
+  });
+  if (afterCloseSnapshot?.error) {
+    return {
+      success: false,
+      error: `Closed position but cannot determine recovered token deltas: ${afterCloseSnapshot.error}`,
+      position: position_address,
+      close_result: closeResult,
+      action_plan: actionPlan,
+    };
+  }
+
+  const recoveredDeltaPlan = calculateBalanceDeltas(beforeCloseSnapshot, afterCloseSnapshot);
+  if (recoveredDeltaPlan.error) {
+    return {
+      success: false,
+      error: `Closed position but redeploy delta sizing is unsafe: ${recoveredDeltaPlan.error}`,
+      position: position_address,
+      close_result: closeResult,
+      recovered_deltas: {
+        delta_x_raw: recoveredDeltaPlan.delta_x_raw ?? null,
+        delta_y_raw: recoveredDeltaPlan.delta_y_raw ?? null,
+      },
+      planning: {
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          before_close_snapshot: beforeCloseSnapshot,
+          after_close_snapshot: afterCloseSnapshot,
+        },
+      },
+      action_plan: {
+        ...actionPlan,
+        deploy_position: {
+          ...actionPlan.deploy_position,
+          amount_x: 0,
+          amount_y: 0,
+        },
+      },
+    };
+  }
+
+  if (strategy === "bid_ask" && recoveredDeltaPlan.amount_y <= 0) {
+    return {
+      success: false,
+      error: "Closed position but bid_ask redeploy requires quote-side amount_y > 0",
+      position: position_address,
+      close_result: closeResult,
+      planning: {
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          recovered_deltas: recoveredDeltaPlan,
+        },
+      },
+      action_plan: {
+        ...actionPlan,
+        deploy_position: {
+          ...actionPlan.deploy_position,
+          amount_x: recoveredDeltaPlan.amount_x,
+          amount_y: recoveredDeltaPlan.amount_y,
+        },
+      },
+    };
+  }
+
+  const deployArgs = {
+    ...actionPlan.deploy_position,
+    amount_x: recoveredDeltaPlan.amount_x,
+    amount_y: recoveredDeltaPlan.amount_y,
+  };
+  const deployResult = await deployPosition(deployArgs);
+
+  if (!deployResult?.success) {
+    return {
+      success: false,
+      error: deployResult?.error || "Rebalance redeploy failed after close",
+      position: position_address,
+      close_result: closeResult,
+      deploy_result: deployResult,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          recovered_deltas: recoveredDeltaPlan,
+          before_close_snapshot: beforeCloseSnapshot,
+          after_close_snapshot: afterCloseSnapshot,
+        },
+      },
+      action_plan: {
+        ...actionPlan,
+        deploy_position: deployArgs,
+      },
+    };
+  }
+
+  recordRebalance(position_address, deployResult.position);
+
+  return {
+    success: true,
+    rebalanced: true,
+    old_position: position_address,
+    new_position: deployResult.position,
+    close_result: closeResult,
+    deploy_result: deployResult,
+    range_snapshot: context.bin_snapshot,
+    range_location: context.range_location,
+    planning: {
+      expected_volume_profile: expectedVolumeProfile,
+      trend_bias: planningData.trend_bias,
+      distribution_plan: distributionPlan,
+      tier_plan: tierPlan,
+      reinvestment_plan: {
+        amount_source: "post_close_balance_delta",
+        recovered_deltas: recoveredDeltaPlan,
+        before_close_snapshot: beforeCloseSnapshot,
+        after_close_snapshot: afterCloseSnapshot,
+      },
+    },
+    action_plan: {
+      ...actionPlan,
+      deploy_position: deployArgs,
+    },
+  };
+}
+
+function resolveCompoundingBias(rangeLocation) {
+  if (rangeLocation.location === "near_upper" || rangeLocation.location === "out_above") {
+    return "quote_heavy";
+  }
+  if (rangeLocation.location === "near_lower" || rangeLocation.location === "out_below") {
+    return "base_heavy";
+  }
+  return "balanced";
+}
+
+function normalizeCompoundingLocation(rangeLocation) {
+  if (rangeLocation.location === "near_upper" || rangeLocation.location === "out_above") {
+    return "near_upper";
+  }
+  if (rangeLocation.location === "near_lower" || rangeLocation.location === "out_below") {
+    return "near_lower";
+  }
+  return "near_center";
+}
+
+export async function autoCompoundFees({
+  position_address,
+  execute_reinvest = false,
+  expected_volume_profile,
+  force_claim = false,
+} = {}) {
+  position_address = normalizeMint(position_address);
+  if (!position_address) {
+    return { success: false, error: "position_address is required" };
+  }
+
+  const context = await getPositionExecutionContext(position_address);
+  if (context.error) {
+    return { success: false, error: context.error, position: position_address };
+  }
+
+  const compoundingLocation = normalizeCompoundingLocation(context.range_location);
+  const compoundingBias = resolveCompoundingBias(context.range_location);
+
+  const planningData = buildPoolPlanningData(context.position, context.bin_snapshot);
+  const expectedVolumeProfile = expected_volume_profile || planningData.expected_volume_profile;
+  const distributionPlan = await chooseDistributionStrategy({
+    pool_data: planningData.pool_data,
+    expected_volume_profile: expectedVolumeProfile,
+  });
+  const tierPlan = await calculateDynamicBinTiers({
+    six_hour_volatility: planningData.pool_data.six_hour_volatility,
+    trend_bias: planningData.trend_bias,
+  });
+
+  let strategy = distributionPlan?.strategy || context.position.strategy || config.strategy.strategy;
+  if (compoundingLocation === "near_upper") strategy = "bid_ask";
+  if (compoundingLocation === "near_lower") strategy = "spot";
+
+  const binsBelow = clampWholeNumber(
+    tierPlan?.range_plan?.bins_below ?? config.strategy.binsBelow,
+    0,
+    MAX_BINS_PER_SIDE
+  );
+  const binsAbove = strategy === "bid_ask"
+    ? 0
+    : clampWholeNumber(tierPlan?.range_plan?.bins_above ?? 0, 0, MAX_BINS_PER_SIDE);
+
+  const reinvestmentPlan = {
+    amount_source: "post_claim_balance_delta",
+    amount_x: null,
+    amount_y: null,
+    bias: compoundingBias,
+    in_place_supported: false,
+    note: "In-place compounding is not safely implementable with current primitives. Duplicate same-pool deployment is intentionally blocked.",
+  };
+
+  const unclaimedFeeUsd = Math.max(
+    0,
+    toFiniteNumber(context.pnl?.unclaimed_fee_usd ?? context.position.unclaimed_fees_usd, 0)
+  );
+
+  const actionPlan = {
+    claim_fees: { position_address },
+    reinvest_plan: {
+      mode: "in_place_only",
+      executes_with_current_primitives: false,
+      blocked_duplicate_pool_deploy: true,
+      blocked_reason: "Current primitives do not support safe in-place compounding. Opening another position in the same pool is blocked.",
+      suggested_parameters: {
+        pool_address: context.position.pool,
+        pool_name: context.position.pool_name || context.position.pair || null,
+        strategy,
+        bins_below: binsBelow,
+        bins_above: binsAbove,
+        amount_x: null,
+        amount_y: null,
+        amount_source: "post_claim_balance_delta",
+        bin_step: context.position.bin_step ?? null,
+        volatility: planningData.pool_data.six_hour_volatility,
+        fee_tvl_ratio: planningData.pool_data.fee_tvl_ratio,
+        organic_score: planningData.pool_data.organic_score,
+      },
+    },
+  };
+
+  const dryRun = process.env.DRY_RUN === "true";
+  if (dryRun) {
+    const claimPreview = await claimFees({ position_address });
+    return {
+      success: true,
+      dry_run: true,
+      executed: false,
+      position: position_address,
+      current_range_location: compoundingLocation,
+      current_bias: compoundingBias,
+      in_range: context.in_range,
+      unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+      range_snapshot: context.bin_snapshot,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: reinvestmentPlan,
+      },
+      claim_preview: claimPreview,
+      action_plan: actionPlan,
+      message: "DRY RUN — claim + compounding plan generated, no transactions sent",
+    };
+  }
+
+  if (!force_claim && unclaimedFeeUsd <= 0) {
+    return {
+      success: true,
+      skipped: true,
+      position: position_address,
+      reason: "No unclaimed fees detected to compound",
+      current_range_location: compoundingLocation,
+      current_bias: compoundingBias,
+      unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: reinvestmentPlan,
+      },
+      action_plan: actionPlan,
+    };
+  }
+
+  const claimResult = await claimFees({ position_address });
+  if (!claimResult?.success) {
+    return {
+      success: false,
+      error: claimResult?.error || "Failed to claim fees before compounding",
+      position: position_address,
+      claim_result: claimResult,
+      action_plan: actionPlan,
+    };
+  }
+
+  if (!execute_reinvest) {
+    return {
+      success: true,
+      claimed: true,
+      compounded: false,
+      position: position_address,
+      current_range_location: compoundingLocation,
+      current_bias: compoundingBias,
+      unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+      claim_result: claimResult,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: reinvestmentPlan,
+      },
+      action_plan: actionPlan,
+      message: "Fees claimed. In-place compounding is not safely supported by current primitives; returned a non-executed action plan.",
+    };
+  }
+
+  return {
+    success: true,
+    claimed: true,
+    compounded: false,
+    reinvest_executed: false,
+    blocked: true,
+    mode: "in_place_only",
+    position: position_address,
+    current_range_location: compoundingLocation,
+    current_bias: compoundingBias,
+    unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+    claim_result: claimResult,
+    reason: "execute_reinvest requested, but duplicate-position deployment is blocked and in-place compounding is not safely supported by current primitives.",
+    planning: {
+      expected_volume_profile: expectedVolumeProfile,
+      trend_bias: planningData.trend_bias,
+      distribution_plan: distributionPlan,
+      tier_plan: tierPlan,
+      reinvestment_plan: reinvestmentPlan,
+    },
+    action_plan: actionPlan,
   };
 }
 

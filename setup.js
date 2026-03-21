@@ -5,10 +5,10 @@
  */
 
 import "dotenv/config";
-import readline from "readline";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -26,31 +26,30 @@ function ask(question, defaultVal) {
 }
 
 function askNum(question, defaultVal, { min, max } = {}) {
-  return new Promise(async (resolve) => {
+  return (async () => {
     while (true) {
       const raw = await ask(question, defaultVal);
       const n = parseFloat(raw);
-      if (isNaN(n))                        { console.log(`  ⚠ Please enter a number.`); continue; }
+      if (Number.isNaN(n))                 { console.log(`  ⚠ Please enter a number.`); continue; }
       if (min !== undefined && n < min)    { console.log(`  ⚠ Minimum is ${min}.`);     continue; }
       if (max !== undefined && n > max)    { console.log(`  ⚠ Maximum is ${max}.`);     continue; }
-      resolve(n);
-      break;
+      return n;
     }
-  });
+  })();
 }
 
 function askChoice(question, choices) {
-  return new Promise(async (resolve) => {
+  return (async () => {
     const labels = choices.map((c, i) => `  ${i + 1}. ${c.label}`).join("\n");
     while (true) {
       console.log(`\n${question}`);
       console.log(labels);
       const raw = await ask("Enter number", "");
-      const idx = parseInt(raw) - 1;
-      if (idx >= 0 && idx < choices.length) { resolve(choices[idx]); break; }
+      const idx = parseInt(raw, 10) - 1;
+      if (idx >= 0 && idx < choices.length) return choices[idx];
       console.log("  ⚠ Invalid choice.");
     }
-  });
+  })();
 }
 
 // ─── Presets ──────────────────────────────────────────────────────────────────
@@ -120,7 +119,7 @@ const presetChoice = await askChoice("Select a risk preset:", [
   { label: "Custom   — Configure every setting manually", key: "custom"  },
 ]);
 
-let preset = presetChoice.key === "custom" ? null : PRESETS[presetChoice.key];
+const preset = presetChoice.key === "custom" ? null : PRESETS[presetChoice.key];
 
 console.log(preset
   ? `\n✓ Using ${preset.label} preset. You can still override individual values below.\n`

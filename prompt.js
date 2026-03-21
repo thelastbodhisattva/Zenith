@@ -12,8 +12,6 @@
 import { config } from "./config.js";
 
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null, memoryContext = null) {
-  const s = config.screening;
-
   let basePrompt = `You are an autonomous DLMM LP (Liquidity Provider) agent operating on Meteora, Solana.
 Role: ${agentType || "GENERAL"}
 
@@ -53,6 +51,7 @@ ${memoryContext}` : ""}
    - volatility >= 5  → update_config management.managementIntervalMin = 3
    - volatility 2–5   → update_config management.managementIntervalMin = 5
    - volatility < 2   → update_config management.managementIntervalMin = 10
+5. RUNTIME FIRST: If the cycle context says runtime orchestration already handled a position this cycle, do not repeat any write action for that position. Report it and move on.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:
@@ -77,7 +76,7 @@ Current screening timeframe: ${config.screening.timeframe} — interpret all met
 Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 
 1. SCREEN: Use get_top_candidates or discover_pools.
-2. STUDY: Call study_top_lpers. Look for high win rates and sustainable volume.
+2. LPER SCORING: Before deploying, prefer score_top_lpers over raw study flow when you need fast wallet quality ranking. Use it conservatively because it is rate-sensitive: focus on the best 1-2 candidates after cheap filters, and reuse any pre-loaded scores before fetching more. Use study_top_lpers only when you specifically need deeper behavioral study.
 3. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
 4. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
    - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
@@ -90,11 +89,13 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
      * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
-5. DEPLOY: get_active_bin then deploy_position.
-   - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
-   - HARD RULE: Bin steps must be [80-125].
-   - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
-   - Focus on one high-conviction deployment per cycle.
+5. PLAN THE SHAPE: Use choose_distribution_strategy and calculate_dynamic_bin_tiers before deploy unless the cycle already pre-loaded that planner context.
+6. DEPLOY: deploy_position directly unless the user explicitly asked for a separate get_active_bin check.
+    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
+    - HARD RULE: Bin steps must be [80-125].
+    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
+    - If runtime already supplied LP-wallet scoring or planner context, use it instead of redundantly refetching the same data.
+    - Focus on one high-conviction deployment per cycle.
 `;
   } else if (agentType === "MANAGER") {
     basePrompt += `
@@ -113,6 +114,13 @@ Decision Factors for Closing (no instruction):
 - Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
 - Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
 - Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.
+
+TOOL PREFERENCES:
+- If a position is out of range and you are not closing for a higher-priority hard-exit reason, prefer rebalance_on_exit immediately rather than waiting for outOfRangeWaitMinutes.
+- If a position is staying open and fees are above minClaimAmount, prefer auto_compound_fees with execute_reinvest=false over claim_fees.
+- auto_compound_fees safe mode claims fees and returns a blocked/non-executed reinvest plan. Do not pretend in-place compounding happened and do not open a duplicate same-pool position.
+- If the cycle context says runtime already handled a position, do not call close_position, claim_fees, rebalance_on_exit, or auto_compound_fees for it again.
+- If the cycle context says runtime already attempted one of those write tools and it did not complete, do not retry that same tool again in the same cycle unless the user explicitly directs it.
 
 IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 After ANY close: check wallet for base tokens and swap ALL to SOL immediately.

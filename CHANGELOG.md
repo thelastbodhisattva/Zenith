@@ -1,17 +1,12 @@
 # Changelog
 
-This file documents the major additions and behavior changes present in this fork of Meridian by fciaf420 and yunus-0x.
+This file documents the major additions and behavior changes present in this fork of Meridian, now rebranded as Zenith.
 
-### Learning and adaptive behavior
+## Recent updates
 
-- Added structured closed-position performance tracking in `lessons.js`.
-- Added lesson derivation from winning and losing positions, with role-aware lesson injection into future prompts.
-- Added adaptive threshold evolution that updates `user-config.json` after enough closed-position history accumulates.
-- Added manual lesson management, pin/unpin flows, performance history reporting, and lesson clearing tools.
-
-### Memory systems
-
-- Added generic long-term fuzzy memory in `memory.js` for generalized strategies, patterns, lessons, and operator-saved facts.
-- Added prompt-level reusable memory injection so previously recalled facts can influence later agent decisions.
-- Added exact per-pool memory in `pool-memory.js` for deploy history, pool notes, recent snapshots, win rate, and recall by pool address.
-- Added live position snapshot recording so management cycles can see recent per-pool drift and out-of-range trends.
+- Added deterministic LP planning flows with `choose_distribution_strategy` and `calculate_dynamic_bin_tiers`, plus runtime reuse of preloaded planner context during screening and rebalance decisions.
+- Added LP-agent wallet scoring with `score_top_lpers`, wallet-score memory per pool, and conservative score preloading for top candidates to stay rate-aware.
+- Added distribution success-rate memory from closed positions so future cycles can reuse prior outcomes by distribution key.
+- Updated runtime orchestration so the manager runs on a 3 minute cadence, prefers `rebalance_on_exit` immediately for out-of-range positions unless a higher-priority exit already fired, and de-duplicates same-cycle actions.
+- Updated fee handling so `auto_compound_fees` stays in safe-mode claim-and-plan mode with no true in-place reinvest, while still using deterministic planning helpers.
+- Refreshed docs and branding, including the README rename from Meridian to Zenith and aligned operator-facing runtime notes.

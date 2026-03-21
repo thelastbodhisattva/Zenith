@@ -1,7 +1,11 @@
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
 import {
   getActiveBin,
+  chooseDistributionStrategy,
+  calculateDynamicBinTiers,
   deployPosition,
+  rebalanceOnExit,
+  autoCompoundFees,
   getMyPositions,
   getWalletPositions,
   getPositionPnl,
@@ -10,7 +14,7 @@ import {
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
-import { getPoolInfo, studyTopLPers } from "./study.js";
+import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -19,7 +23,7 @@ import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStra
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds } from "../config.js";
+import { config } from "../config.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -41,7 +45,11 @@ const toolMap = {
   get_pool_detail: getPoolDetail,
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,
+  choose_distribution_strategy: chooseDistributionStrategy,
+  calculate_dynamic_bin_tiers: calculateDynamicBinTiers,
   deploy_position: deployPosition,
+  rebalance_on_exit: rebalanceOnExit,
+  auto_compound_fees: autoCompoundFees,
   get_my_positions: getMyPositions,
   get_wallet_positions: getWalletPositions,
   search_pools: searchPools,
@@ -58,6 +66,7 @@ const toolMap = {
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
   study_top_lpers: studyTopLPers,
+  score_top_lpers: scoreTopLPers,
   get_pool_info: getPoolInfo,
   set_position_note: ({ position_address, instruction }) => {
     const ok = setPositionInstruction(position_address, instruction || null);
@@ -168,7 +177,6 @@ const toolMap = {
       screeningModel: ["llm", "screeningModel"],
       generalModel: ["llm", "generalModel"],
       // strategy
-      minBinStep: ["strategy", "minBinStep"],
       binsBelow: ["strategy", "binsBelow"],
     };
 
@@ -234,6 +242,8 @@ const toolMap = {
 // Tools that modify on-chain state (need extra safety checks)
 const WRITE_TOOLS = new Set([
   "deploy_position",
+  "rebalance_on_exit",
+  "auto_compound_fees",
   "claim_fees",
   "close_position",
   "swap_token",
@@ -419,6 +429,17 @@ async function runSafetyChecks(name, args) {
     case "swap_token": {
       // Basic check — prevent swapping when DRY_RUN is true
       // (handled inside swapToken itself, but belt-and-suspenders)
+      return { pass: true };
+    }
+
+    case "rebalance_on_exit":
+    case "auto_compound_fees": {
+      if (!args?.position_address) {
+        return {
+          pass: false,
+          reason: "position_address is required.",
+        };
+      }
       return { pass: true };
     }
 
