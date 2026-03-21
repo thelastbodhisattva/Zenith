@@ -25,3 +25,6 @@ logs/
 
 # Dev context
 context.md
+
+# nuggets data
+data/*

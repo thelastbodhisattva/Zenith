@@ -7,7 +7,7 @@
   "scripts": {
     "setup": "node setup.js",
     "start": "node index.js",
-    "dev": "DRY_RUN=true node index.js",
+    "dev": "node -e \"process.env.DRY_RUN='true'; import('./index.js').catch((e)=>{console.error(e); process.exit(1);})\"",
     "test:screen": "node test/test-screening.js",
     "test:agent": "node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
