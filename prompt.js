@@ -11,6 +11,79 @@
  */
 import { config } from "./config.js";
 
+function formatCompactJson(value) {
+  return JSON.stringify(value, null, 2);
+}
+
+function summarizePortfolio(portfolio = {}) {
+  return {
+    sol: portfolio.sol ?? 0,
+    usd: portfolio.usd ?? portfolio.total_usd ?? null,
+    token_count: Array.isArray(portfolio.tokens) ? portfolio.tokens.length : 0,
+  };
+}
+
+function summarizePositions(positions = {}) {
+  const list = Array.isArray(positions?.positions) ? positions.positions : [];
+  return {
+    total_positions: positions?.total_positions ?? list.length,
+    sample: list.slice(0, 3).map((position) => ({
+      pair: position.pair,
+      pool: position.pool,
+      in_range: position.in_range,
+      age_minutes: position.age_minutes,
+      unclaimed_fees_usd: position.unclaimed_fees_usd,
+    })),
+  };
+}
+
+function summarizeState(stateSummary = {}) {
+  return {
+    open_positions: stateSummary?.open_positions ?? 0,
+    closed_positions: stateSummary?.closed_positions ?? 0,
+    total_fees_claimed_usd: stateSummary?.total_fees_claimed_usd ?? 0,
+    recent_events: (stateSummary?.recent_events || []).slice(-5),
+    evaluation: stateSummary?.evaluation || null,
+  };
+}
+
+function summarizePerformance(perfSummary) {
+  if (!perfSummary) return "No closed positions yet";
+  return formatCompactJson({
+    total_positions_closed: perfSummary.total_positions_closed,
+    total_pnl_usd: perfSummary.total_pnl_usd,
+    avg_pnl_pct: perfSummary.avg_pnl_pct,
+    avg_range_efficiency_pct: perfSummary.avg_range_efficiency_pct,
+    win_rate_pct: perfSummary.win_rate_pct,
+  });
+}
+
+function summarizeConfigForPrompt() {
+  return {
+    screening: {
+      minFeeActiveTvlRatio: config.screening.minFeeActiveTvlRatio,
+      minVolume: config.screening.minVolume,
+      minTokenFeesSol: config.screening.minTokenFeesSol,
+      maxBundlersPct: config.screening.maxBundlersPct,
+      maxTop10Pct: config.screening.maxTop10Pct,
+      timeframe: config.screening.timeframe,
+      category: config.screening.category,
+    },
+    management: {
+      minClaimAmount: config.management.minClaimAmount,
+      outOfRangeBinsToClose: config.management.outOfRangeBinsToClose,
+      outOfRangeWaitMinutes: config.management.outOfRangeWaitMinutes,
+      emergencyPriceDropPct: config.management.emergencyPriceDropPct,
+      stopLossPct: config.management.stopLossPct,
+      takeProfitFeePct: config.management.takeProfitFeePct,
+      trailingTakeProfit: config.management.trailingTakeProfit,
+      trailingTriggerPct: config.management.trailingTriggerPct,
+      trailingDropPct: config.management.trailingDropPct,
+    },
+    schedule: config.schedule,
+  };
+}
+
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null, memoryContext = null) {
   let basePrompt = `You are an autonomous DLMM LP (Liquidity Provider) agent operating on Meteora, Solana.
 Role: ${agentType || "GENERAL"}
@@ -19,16 +92,12 @@ Role: ${agentType || "GENERAL"}
  CURRENT STATE
 ═══════════════════════════════════════════
 
-Portfolio: ${JSON.stringify(portfolio, null, 2)}
-Open Positions: ${JSON.stringify(positions, null, 2)}
-Memory: ${JSON.stringify(stateSummary, null, 2)}
-Performance: ${perfSummary ? JSON.stringify(perfSummary, null, 2) : "No closed positions yet"}
+Portfolio: ${formatCompactJson(summarizePortfolio(portfolio))}
+Open Positions: ${formatCompactJson(summarizePositions(positions))}
+State: ${formatCompactJson(summarizeState(stateSummary))}
+Performance: ${summarizePerformance(perfSummary)}
 
-Config: ${JSON.stringify({
-  screening: config.screening,
-  management: config.management,
-  schedule: config.schedule,
-}, null, 2)}
+Config: ${formatCompactJson(summarizeConfigForPrompt())}
 
 ${lessons ? `═══════════════════════════════════════════
  LESSONS LEARNED
@@ -47,11 +116,8 @@ ${memoryContext}` : ""}
 1. PATIENCE IS PROFIT: DLMM LPing is about capturing fees over time. Avoid "paper-handing" or closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason. However, swap_token after a close is MANDATORY for any token worth >= $0.10. Skip tokens below $0.10 (dust — not worth the gas). Always check token USD value before swapping.
 3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
-4. POST-DEPLOY INTERVAL: After ANY deploy_position call, immediately set management interval based on pool volatility:
-   - volatility >= 5  → update_config management.managementIntervalMin = 3
-   - volatility 2–5   → update_config management.managementIntervalMin = 5
-   - volatility < 2   → update_config management.managementIntervalMin = 10
-5. RUNTIME FIRST: If the cycle context says runtime orchestration already handled a position this cycle, do not repeat any write action for that position. Report it and move on.
+4. RUNTIME FIRST: If the cycle context says runtime orchestration already handled a position this cycle, do not repeat any write action for that position. Report it and move on.
+5. SCHEDULING IS RUNTIME-OWNED: Do not use update_config to tune management interval from per-pool volatility during normal screening or management. Runtime enforces management cadence from the most volatile open position.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:
@@ -75,26 +141,26 @@ Current screening timeframe: ${config.screening.timeframe} — interpret all met
     basePrompt += `
 Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 
-1. SCREEN: Use get_top_candidates or discover_pools.
-2. LPER SCORING: Before deploying, prefer score_top_lpers over raw study flow when you need fast wallet quality ranking. Use it conservatively because it is rate-sensitive: focus on the best 1-2 candidates after cheap filters, and reuse any pre-loaded scores before fetching more. Use study_top_lpers only when you specifically need deeper behavioral study.
-3. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
+1. SCREEN: Use get_top_candidates as the primary screening tool. Use discover_pools only if the user explicitly asks for raw discovery output.
+2. LPER SCORING: Before deploying, prefer score_top_lpers when you need fast wallet quality ranking. Use it conservatively because it is rate-sensitive: focus on the best 1-2 candidates after cheap filters, and reuse any pre-loaded scores before fetching more.
+3. MEMORY: Before deploying to any pool, prefer pre-loaded pool memory. Call get_pool_memory only when that context is missing and materially matters.
 4. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
-   - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
-   - HARD SKIP if global_fees_sol < minTokenFeesSol (default 30 SOL). Low fees = bundled txs or scam. No exceptions.
-   - Smart wallets present + fees pass → strong signal, proceed to deploy.
-   - No smart wallets → also call get_token_narrative before deciding:
-     * SKIP if top_10_real_holders_pct > 60% OR bundlers > 30% OR narrative is empty/null/pure hype with no specific story
-     * CAUTION if bundlers 15–30% AND top_10 > 40% — check organic + buy/sell pressure
-     * Bundlers 5–15% are normal, not a skip signal on their own
-     * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
-     * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
-     * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
+    - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
+    - Respect runtime hard gates. If a candidate is marked BLOCKED, do not deploy it.
+    - Smart wallets present + fees pass → strong signal, proceed to deploy.
+    - No smart wallets → also call get_token_narrative before deciding:
+      * Treat missing narrative plus no smart wallets as a strong negative
+      * CAUTION if bundlers 15–30% AND top_10 > 40% — check organic + buy/sell pressure
+      * Bundlers 5–15% are normal, not a skip signal on their own
+      * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
+      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
+      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
 5. PLAN THE SHAPE: Use choose_distribution_strategy and calculate_dynamic_bin_tiers before deploy unless the cycle already pre-loaded that planner context.
 6. DEPLOY: deploy_position directly unless the user explicitly asked for a separate get_active_bin check.
-    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
-    - HARD RULE: Bin steps must be [80-125].
-    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
-    - If runtime already supplied LP-wallet scoring or planner context, use it instead of redundantly refetching the same data.
+     - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
+     - HARD RULE: Bin steps must be [80-125].
+     - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
+     - If runtime already supplied LP-wallet scoring or planner context, use it instead of redundantly refetching the same data.
     - Focus on one high-conviction deployment per cycle.
 `;
   } else if (agentType === "MANAGER") {
