@@ -369,7 +369,6 @@ ${pendingExitAlerts.join("\n")}
 2. instruction set AND condition NOT met → HOLD, skip remaining rules
 3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
 4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-<<<<<<< HEAD
 5. in_range = false → REBALANCE with rebalance_on_exit immediately, unless a higher-priority close rule already fired
 6. fee_per_tvl_24h < ${config.management.minFeePerTvl24h} AND age_minutes >= 60 → CLOSE (fee yield too low)
 7. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio} AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
