@@ -7,6 +7,7 @@
 ## What it does
 
 - **Screens pools** — continuously filters Meteora DLMM opportunities by fee/active-TVL, TVL, volume, organic score, holder count, market cap, bin step, and token-fee quality signals
+- **Ranks candidates deterministically** — assigns auditable screening scores in code before the LLM reasons about the final deploy choice
 - **Plans deployments deterministically** — uses `choose_distribution_strategy` and `calculate_dynamic_bin_tiers` to shape each deployment or rebalance before capital is placed
 - **Scores LP wallets** — uses `score_top_lpers` to rank strong wallets for a pool, with optional enrichment when LP-agent scoring data is available
 - **Manages positions actively** — monitors open positions, claims fees when justified, and rebalances out-of-range positions immediately when no higher-priority hard exit applies
@@ -17,7 +18,7 @@
 
 ## How it works
 
-Zenith runs a ReAct-style agent loop on top of a deterministic runtime. The LLM still reasons about what to do next, but the runtime preloads key context, enforces tool preferences, and de-duplicates write actions so the same position is not handled twice in one cycle.
+Zenith runs a ReAct-style agent loop on top of a deterministic runtime. The LLM still reasons about what to do next, but the runtime now owns more of the control plane: candidate ranking, hard screening gates, cycle evaluation records, tool-outcome tracking, and same-cycle write de-duplication.
 
 Two specialized agents run on independent schedules:
 
@@ -29,10 +30,12 @@ Two specialized agents run on independent schedules:
 A third health check runs hourly to summarize portfolio state.
 
 **Current runtime behavior:**
-- Screening cycles can preload LP-wallet scoring and planner context for top candidates, then reuse that context instead of refetching `score_top_lpers`, `choose_distribution_strategy`, or `calculate_dynamic_bin_tiers`
+- Screening cycles rank candidates in code first, then preload LP-wallet scoring and planner context for the strongest finalists instead of refetching `score_top_lpers`, `choose_distribution_strategy`, or `calculate_dynamic_bin_tiers` blindly
 - Management cycles prefer `rebalance_on_exit` immediately when a position is out of range and no higher-priority stop-loss / trailing-take-profit / instruction-driven exit already fired
+- Management cadence is runtime-owned and auto-adjusts from the most volatile open position: `>= 5 -> 3m`, `>= 2 -> 5m`, otherwise `10m`
 - Fee handling prefers `auto_compound_fees` in safe mode with `execute_reinvest=false`; this claims fees and returns a reinvest plan, but does **not** perform true in-place compounding
 - Runtime protections prevent duplicate close/claim/rebalance/compound actions for the same position within the same cycle
+- Screening prompts are intentionally slimmer: deterministic control signals stay visible, but narrative and memory context are truncated so the model sees less noise
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -138,8 +141,10 @@ Edit `user-config.json`. The example file is a starting point; the runtime defau
 | `category` | `trending` | Pool category filter |
 | `takeProfitFeePct` | `5` | Close when fees reach this percent of deployed capital |
 | `minClaimAmount` | `5` | Fee threshold for claim / safe-mode compounding |
-| `outOfRangeWaitMinutes` | `30` | Recorded out-of-range timing window; runtime management now prefers immediate rebalance planning instead of waiting by default |
+| `outOfRangeWaitMinutes` | `30` | Recorded out-of-range timing window and alert context; runtime management cadence is now enforced from live open-position volatility |
 | `minVolumeToRebalance` | `1000` | Minimum pool volume needed for rebalance logic |
+| `maxBundlersPct` | `30` | Maximum allowed bundler concentration across top-100 holders |
+| `maxTop10Pct` | `60` | Maximum allowed top-10 real-holder concentration |
 
 ---
 
@@ -197,15 +202,25 @@ Zenith stores structured knowledge in local memory files and reuses it in later 
 
 ### LP-wallet score memory
 
-When `score_top_lpers` runs, the agent stores wallet-score memory keyed to the pool. That memory keeps the top scored wallets, score breakdowns, and whether optional enrichment was available, so later cycles can reuse the prior ranking instead of paying for repeated lookups.
+When `score_top_lpers` runs, the agent stores wallet-score memory keyed to the pool. That memory keeps the top scored wallets, score breakdowns, and whether optional enrichment was available, so later cycles can reuse the prior ranking instead of paying for repeated lookups. Wallet-score memory also carries freshness metadata so runtime can reuse it conservatively instead of treating old scores as evergreen truth.
 
 ### Distribution success-rate memory
 
 When positions close, Zenith records distribution success-rate memory by distribution key. This tracks win rate, average PnL, average fee yield, hold time, recent pools, and strategy-level outcomes so the agent can reason from prior distribution performance.
 
-### Lessons and threshold evolution
+### Broader strategy memory
+
+Strategy memory no longer depends only on exact `strategy + bin step` pairings. Zenith now stores broader reusable strategy buckets (for example tight / standard / wide bin-step groups) so lessons transfer more safely without exploding prompt size or overfitting to exact historical settings.
+
+### Lessons, thresholds, and evaluation
 
 `/learn` still supports deeper top-LPer study for qualitative lessons, while `/evolve` updates screening thresholds from closed-position history. Those lessons and evolved thresholds are fed back into future cycles without requiring a restart.
+
+Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, and compact counters such as candidates scored, candidates blocked, runtime actions handled, and write-tool blocks/errors. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
+
+### Candidate quality gates
+
+Holder-quality checks now rely on stronger signals such as `common_funder` and `funded_same_window`. The older `similar_amount` heuristic was removed because it over-flagged legitimate small holders at top-100 scale.
 
 ---
 
