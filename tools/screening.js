@@ -12,6 +12,8 @@ const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
  */
 export async function discoverPools({
   page_size = 50,
+  timeframe = config.screening.timeframe,
+  category = config.screening.category,
 } = {}) {
   const s = config.screening;
   const filters = [
@@ -35,8 +37,8 @@ export async function discoverPools({
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
-    `&timeframe=${s.timeframe}` +
-    `&category=${s.category}`;
+    `&timeframe=${timeframe}` +
+    `&category=${category}`;
 
   const res = await fetch(url);
 
@@ -73,7 +75,6 @@ export async function discoverPools({
  * Hard filters applied in code, agent decides which to deploy into.
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
-  const { config } = await import("../config.js");
   const { pools } = await discoverPools({ page_size: 50 });
 
   // Exclude pools where the wallet already has an open position
@@ -82,13 +83,70 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const eligible = pools
-    .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
-    .slice(0, limit);
+  const { candidates, blocked_summary, total_eligible } = rankCandidateSnapshots(pools, {
+    occupiedPools,
+    occupiedMints,
+    limit,
+  });
 
   return {
-    candidates: eligible,
+    candidates,
     total_screened: pools.length,
+    total_eligible,
+    blocked_summary,
+  };
+}
+
+export function rankCandidateSnapshots(pools, {
+  occupiedPools = new Set(),
+  occupiedMints = new Set(),
+  limit = 10,
+} = {}) {
+  const evaluations = pools.map((pool) => evaluateCandidateSnapshot(pool, { occupiedPools, occupiedMints }));
+  const blocked_summary = summarizeBlockedCandidates(evaluations);
+  const candidates = evaluations
+    .filter((pool) => pool.eligible)
+    .sort(compareCandidateScores)
+    .slice(0, limit)
+    .map((pool, index) => ({
+      ...pool,
+      score_rank: index + 1,
+    }));
+
+  return {
+    candidates,
+    total_eligible: evaluations.filter((pool) => pool.eligible).length,
+    blocked_summary,
+    evaluations,
+  };
+}
+
+export function evaluateCandidateSnapshot(pool, {
+  occupiedPools = new Set(),
+  occupiedMints = new Set(),
+} = {}) {
+  const hard_blocks = [];
+  const gate_results = {
+    pool_unoccupied: !occupiedPools.has(pool.pool),
+    token_unoccupied: !pool.base?.mint || !occupiedMints.has(pool.base.mint),
+    not_blacklisted: !isBlacklisted(pool.base?.mint),
+  };
+
+  if (!gate_results.pool_unoccupied) hard_blocks.push("pool_already_open");
+  if (!gate_results.token_unoccupied) hard_blocks.push("base_token_already_held");
+  if (!gate_results.not_blacklisted) hard_blocks.push("base_token_blacklisted");
+
+  const score_breakdown = buildCandidateScore(pool);
+  const deterministic_score = score_breakdown.total_score;
+
+  return {
+    ...pool,
+    eligible: hard_blocks.length === 0,
+    eligibility_reason: hard_blocks[0] || "eligible",
+    hard_blocks,
+    gate_results,
+    deterministic_score,
+    score_breakdown,
   };
 }
 
@@ -175,6 +233,92 @@ function condensePool(p) {
     swap_count: p.swap_count,
     unique_traders: p.unique_traders,
   };
+}
+
+function buildCandidateScore(pool) {
+  const feeEfficiency = normalizeFloor(pool.fee_active_tvl_ratio, config.screening.minFeeActiveTvlRatio, 4);
+  const volume = normalizeFloor(pool.volume_window, config.screening.minVolume, 20);
+  const organic = normalizeRange(pool.organic_score, config.screening.minOrganic, 100);
+  const holderDepth = normalizeFloor(pool.holders, config.screening.minHolders, 4);
+  const activeLiquidity = clamp01((pool.active_pct ?? 0) / 100);
+  const volatilityFit = scoreVolatility(pool.volatility);
+
+  const weighted = {
+    fee_efficiency: round2(feeEfficiency * 30),
+    volume: round2(volume * 20),
+    organic: round2(organic * 20),
+    holder_depth: round2(holderDepth * 10),
+    active_liquidity: round2(activeLiquidity * 10),
+    volatility_fit: round2(volatilityFit * 10),
+  };
+
+  const total_score = round2(Object.values(weighted).reduce((sum, value) => sum + value, 0));
+
+  return {
+    total_score,
+    components: weighted,
+    raw_inputs: {
+      fee_active_tvl_ratio: pool.fee_active_tvl_ratio,
+      volume_window: pool.volume_window,
+      organic_score: pool.organic_score,
+      holders: pool.holders,
+      active_pct: pool.active_pct,
+      volatility: pool.volatility,
+    },
+  };
+}
+
+function summarizeBlockedCandidates(pools) {
+  const summary = {};
+
+  for (const pool of pools) {
+    for (const reason of pool.hard_blocks || []) {
+      summary[reason] = (summary[reason] || 0) + 1;
+    }
+  }
+
+  return summary;
+}
+
+function compareCandidateScores(a, b) {
+  if (b.deterministic_score !== a.deterministic_score) return b.deterministic_score - a.deterministic_score;
+  if ((b.organic_score ?? 0) !== (a.organic_score ?? 0)) return (b.organic_score ?? 0) - (a.organic_score ?? 0);
+  return (b.volume_window ?? 0) - (a.volume_window ?? 0);
+}
+
+function normalizeFloor(value, floor, stretchMultiplier) {
+  const num = Number(value);
+  const min = Number(floor);
+  const cap = min * stretchMultiplier;
+
+  if (!Number.isFinite(num) || !Number.isFinite(min) || min <= 0) return 0;
+  return clamp01(num / cap);
+}
+
+function normalizeRange(value, min, max) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  if (num <= min) return 0;
+  if (num >= max) return 1;
+  return clamp01((num - min) / Math.max(1, max - min));
+}
+
+function scoreVolatility(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0.25;
+  if (num <= 2) return 0.55;
+  if (num <= 6) return 1;
+  if (num <= 12) return 0.75;
+  if (num <= 18) return 0.45;
+  return 0.2;
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function round2(value) {
+  return Number(value.toFixed(2));
 }
 
 function round(n) {
