@@ -4,7 +4,7 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SAVE_DIR = path.join(__dirname, "data", "nuggets");
+const SAVE_DIR = process.env.ZENITH_MEMORY_DIR || path.join(__dirname, "data", "nuggets");
 const DEFAULT_NUGGETS = ["strategies", "lessons", "patterns", "facts", "wallet_scores", "distribution_stats"];
 
 let shelf = null;
@@ -114,6 +114,22 @@ function round(value, decimals = 2) {
   return Math.round(value * factor) / factor;
 }
 
+function getBinStepBucket(binStep) {
+  const value = Number(binStep);
+  if (!Number.isFinite(value)) return "unknown";
+  if (value < 90) return "tight";
+  if (value <= 110) return "standard";
+  return "wide";
+}
+
+export function buildStrategyMemoryKey(strategy, binStep = null) {
+  return sanitizeKey(`strategy-${String(strategy || "unknown").toLowerCase()}-${getBinStepBucket(binStep)}`);
+}
+
+function buildLegacyStrategyMemoryKey(strategy, binStep = null) {
+  return sanitizeKey(`${String(strategy || "unknown").toLowerCase()}_bs${binStep}`);
+}
+
 function scoreFact(fact, query) {
   const rawQuery = String(query || "").toLowerCase();
   const queryTokens = tokenize(query);
@@ -201,7 +217,10 @@ export function getShelf() {
 }
 
 export function rememberStrategy(pattern, result) {
-  const key = upsertFact("strategies", pattern, typeof result === "string" ? result : JSON.stringify(result));
+  const key = typeof pattern === "object" && pattern !== null
+    ? buildStrategyMemoryKey(pattern.strategy, pattern.bin_step)
+    : sanitizeKey(pattern);
+  upsertFact("strategies", key, typeof result === "string" ? result : JSON.stringify(result));
   log("memory", `Remembered strategy: ${key}`);
 }
 
@@ -210,22 +229,39 @@ export function recallForScreening(poolData) {
 
   if (poolData?.bin_step) {
     for (const strategy of ["bid_ask", "spot"]) {
-      const hit = recallBest(`${strategy}_bs${poolData.bin_step}`, "strategies");
-      if (hit.found && !results.some((result) => result.key === hit.key)) {
-        results.push({ source: "strategies", ...hit });
+      const keysToTry = [
+        buildStrategyMemoryKey(strategy, poolData.bin_step),
+        buildLegacyStrategyMemoryKey(strategy, poolData.bin_step),
+      ];
+
+      for (const key of keysToTry) {
+        const hit = recallBest(key, "strategies");
+        if (hit.found && !results.some((result) => result.key === hit.key)) {
+          results.push({ source: "strategies", ...hit });
+          break;
+        }
       }
     }
   }
 
-  return results;
+  return results.slice(0, 2);
 }
 
 export function recallForManagement(position) {
   const results = [];
 
   if (position?.strategy && position?.bin_step != null) {
-    const hit = recallBest(`${position.strategy}_bs${position.bin_step}`, "strategies");
-    if (hit.found) results.push({ source: "strategies", ...hit });
+    const keysToTry = [
+      buildStrategyMemoryKey(position.strategy, position.bin_step),
+      buildLegacyStrategyMemoryKey(position.strategy, position.bin_step),
+    ];
+    for (const key of keysToTry) {
+      const hit = recallBest(key, "strategies");
+      if (hit.found) {
+        results.push({ source: "strategies", ...hit });
+        break;
+      }
+    }
   }
 
   const lessonHit = recallBest("management", "lessons");
@@ -236,22 +272,29 @@ export function recallForManagement(position) {
 
 export function getMemoryContext() {
   const store = getShelf();
-  const lines = [];
+  const facts = [];
 
   for (const { name } of store.list()) {
     const nugget = store.get(name);
-    const relevant = nugget.facts
-      .filter((fact) => (fact.hits || 0) >= 1)
-      .sort((a, b) => (b.hits || 0) - (a.hits || 0))
-      .slice(0, 10);
-
-    if (!relevant.length) continue;
-
-    lines.push(`[${name}]`);
-    for (const fact of relevant) {
-      lines.push(`  ${fact.key}: ${fact.value}`);
+    for (const fact of nugget.facts) {
+      if ((fact.hits || 0) < 1) continue;
+      facts.push({
+        nugget: name,
+        key: fact.key,
+        value: fact.value,
+        hits: fact.hits || 0,
+        updated_at: fact.updated_at || fact.created_at || "",
+      });
     }
   }
+
+  const lines = facts
+    .sort((a, b) => {
+      if (b.hits !== a.hits) return b.hits - a.hits;
+      return String(b.updated_at).localeCompare(String(a.updated_at));
+    })
+    .slice(0, 6)
+    .map((fact) => `[${fact.nugget}] ${fact.key}: ${fact.value}`);
 
   return lines.length ? lines.join("\n") : null;
 }
@@ -348,6 +391,9 @@ export function getWalletScoreMemory(poolAddress) {
     found: true,
     pool_address: poolAddress,
     scored_at: fact.data?.scored_at || fact.updated_at,
+    age_minutes: fact.data?.scored_at
+      ? Math.max(0, Math.round((Date.now() - new Date(fact.data.scored_at).getTime()) / 60000))
+      : null,
     scoring: fact.data?.scoring || {},
     metadata: fact.data?.metadata || {},
     scored_wallets: fact.data?.scored_wallets || [],
