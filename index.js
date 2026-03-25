@@ -8,6 +8,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceHistory, getPerformanceSummary } from "./lessons.js";
+import { getScreeningThresholdSummary } from "./runtime-helpers.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
@@ -18,6 +19,7 @@ import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { getWalletScoreMemory, initMemory, recallForManagement, recallForScreening } from "./memory.js";
 import { deriveExpectedVolumeProfile, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { getLpOverview } from "./tools/lp-overview.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -1215,23 +1217,39 @@ Commands:
       await runBusy(async () => {
         const summary = getPerformanceSummary();
         const history = getPerformanceHistory({ hours: 168, limit: 5 });
+        const lpOverview = await getLpOverview().catch(() => null);
 
-        if (!summary) {
+        if (!summary && !lpOverview) {
           console.log("\nNo closed-position performance recorded yet.\n");
           return;
         }
 
         console.log("\nPerformance summary:\n");
-        console.log(`  total_positions_closed:   ${summary.total_positions_closed}`);
-        console.log(`  total_pnl_usd:            ${summary.total_pnl_usd}`);
-        console.log(`  total_inventory_pnl_usd:  ${summary.total_inventory_pnl_usd}`);
-        console.log(`  total_fee_component_usd:  ${summary.total_fee_component_usd}`);
-        console.log(`  avg_pnl_pct:              ${summary.avg_pnl_pct}%`);
-        console.log(`  avg_range_efficiency_pct: ${summary.avg_range_efficiency_pct}%`);
-        console.log(`  avg_operational_touches:  ${summary.avg_operational_touch_count}`);
-        console.log(`  win_rate_pct:             ${summary.win_rate_pct}%`);
+        if (summary) {
+          console.log(`  total_positions_closed:   ${summary.total_positions_closed}`);
+          console.log(`  total_pnl_usd:            ${summary.total_pnl_usd}`);
+          console.log(`  total_inventory_pnl_usd:  ${summary.total_inventory_pnl_usd}`);
+          console.log(`  total_fee_component_usd:  ${summary.total_fee_component_usd}`);
+          console.log(`  avg_pnl_pct:              ${summary.avg_pnl_pct}%`);
+          console.log(`  avg_range_efficiency_pct: ${summary.avg_range_efficiency_pct}%`);
+          console.log(`  avg_operational_touches:  ${summary.avg_operational_touch_count}`);
+          console.log(`  win_rate_pct:             ${summary.win_rate_pct}%`);
+        }
 
-        if (history.positions.length > 0) {
+        if (lpOverview) {
+          console.log("\n  LP Agent overview:");
+          console.log(`    total_pnl_usd:    ${lpOverview.total_pnl_usd}`);
+          console.log(`    total_pnl_sol:    ${lpOverview.total_pnl_sol}`);
+          console.log(`    total_fees_usd:   ${lpOverview.total_fees_usd}`);
+          console.log(`    total_fees_sol:   ${lpOverview.total_fees_sol}`);
+          console.log(`    win_rate_pct:     ${lpOverview.win_rate_pct}%`);
+          console.log(`    open_positions:   ${lpOverview.open_positions}`);
+          console.log(`    closed_positions: ${lpOverview.closed_positions}`);
+          console.log(`    avg_hold_hours:   ${lpOverview.avg_hold_hours}`);
+          console.log(`    roi_pct:          ${lpOverview.roi_pct}%`);
+        }
+
+        if (summary && history.positions.length > 0) {
           console.log("\n  Recent closes:");
           for (const row of history.positions) {
             console.log(`    - ${row.pool_name}: pnl=${row.pnl_usd} usd | inventory=${row.inventory_pnl_usd} | fees=${row.fee_component_usd} | touches=${row.operational_touch_count} | reason=${row.close_reason}`);
@@ -1246,14 +1264,9 @@ Commands:
       const s = config.screening;
       const evaluation = getStateSummary().evaluation;
       console.log("\nCurrent screening thresholds:");
-      console.log(`  minFeeActiveTvlRatio: ${s.minFeeActiveTvlRatio}`);
-      console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
-      console.log(`  maxBundlersPct:       ${s.maxBundlersPct}`);
-      console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
-      console.log(`  minOrganic:       ${s.minOrganic}`);
-      console.log(`  minHolders:       ${s.minHolders}`);
-      console.log(`  minVolume:        ${s.minVolume}`);
-      console.log(`  timeframe:        ${s.timeframe}`);
+      for (const [label, value] of getScreeningThresholdSummary(s)) {
+        console.log(`  ${label}: ${value}`);
+      }
       const perf = getPerformanceSummary();
       if (perf) {
         console.log(`\n  Based on ${perf.total_positions_closed} closed positions`);

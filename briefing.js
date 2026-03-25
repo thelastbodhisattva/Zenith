@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
+import { getLpOverview } from "./tools/lp-overview.js";
 
 const STATE_FILE = "./state.json";
 const LESSONS_FILE = "./lessons.json";
@@ -17,10 +18,11 @@ export async function generateBriefing() {
   const openedLast24h = allPositions.filter(p => new Date(p.deployed_at) > last24h);
   const closedLast24h = allPositions.filter(p => p.closed && new Date(p.closed_at) > last24h);
 
-  // 2. Performance Activity (from performance log)
+  // 2. Performance Activity (prefer LP Agent overview, fall back to local performance log)
   const perfLast24h = (lessonsData.performance || []).filter(p => new Date(p.recorded_at) > last24h);
   const totalPnLUsd = perfLast24h.reduce((sum, p) => sum + (p.pnl_usd || 0), 0);
   const totalFeesUsd = perfLast24h.reduce((sum, p) => sum + (p.fees_earned_usd || 0), 0);
+  const lpOverview = await getLpOverview().catch(() => null);
 
   // 3. Lessons Learned
   const lessonsLast24h = (lessonsData.lessons || []).filter(l => new Date(l.created_at) > last24h);
@@ -38,11 +40,17 @@ export async function generateBriefing() {
     `📤 Positions Closed: ${closedLast24h.length}`,
     "",
     `<b>Performance:</b>`,
-    `💰 Net PnL: ${totalPnLUsd >= 0 ? "+" : ""}$${totalPnLUsd.toFixed(2)}`,
-    `💎 Fees Earned: $${totalFeesUsd.toFixed(2)}`,
-    perfLast24h.length > 0
-      ? `📈 Win Rate (24h): ${Math.round((perfLast24h.filter(p => p.pnl_usd > 0).length / perfLast24h.length) * 100)}%`
-      : "📈 Win Rate (24h): N/A",
+    lpOverview
+      ? `💰 Total PnL: $${lpOverview.total_pnl_usd} (${lpOverview.total_pnl_sol} SOL)`
+      : `💰 Net PnL: ${totalPnLUsd >= 0 ? "+" : ""}$${totalPnLUsd.toFixed(2)}`,
+    lpOverview
+      ? `💎 Total Fees: $${lpOverview.total_fees_usd} (${lpOverview.total_fees_sol} SOL)`
+      : `💎 Fees Earned: $${totalFeesUsd.toFixed(2)}`,
+    lpOverview
+      ? `📈 Win Rate: ${lpOverview.win_rate_pct}% | Avg Hold: ${lpOverview.avg_hold_hours}h | ROI: ${lpOverview.roi_pct}%`
+      : perfLast24h.length > 0
+        ? `📈 Win Rate (24h): ${Math.round((perfLast24h.filter(p => p.pnl_usd > 0).length / perfLast24h.length) * 100)}%`
+        : "📈 Win Rate (24h): N/A",
     "",
     `<b>Lessons Learned:</b>`,
     lessonsLast24h.length > 0
@@ -51,9 +59,11 @@ export async function generateBriefing() {
     "",
     `<b>Current Portfolio:</b>`,
     `📂 Open Positions: ${openPositions.length}`,
-    perfSummary
-      ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
-      : "",
+    lpOverview
+      ? `📊 LP Agent: ${lpOverview.open_positions} open / ${lpOverview.closed_positions} closed`
+      : perfSummary
+        ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
+        : "",
     "────────────────"
   ];
 
