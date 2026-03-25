@@ -3,12 +3,12 @@
  * Run: node test/test-screening.js
  */
 
-import { discoverPools, getPoolDetail } from "../tools/screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates } from "../tools/screening.js";
 
 async function main() {
   console.log("=== Testing Pool Discovery API ===\n");
 
-  // Test 1: Top pools
+  // Test 1: Raw discovery pools
   console.log("Fetching top 10 pools (24h)...");
   const top = await discoverPools({ page_size: 10, timeframe: "24h", category: "top" });
   console.log(`Found ${top.total} total pools, showing ${top.pools.length}`);
@@ -18,20 +18,31 @@ async function main() {
     console.log("\nTop pool:");
     console.log(`  Name: ${best.name}`);
     console.log(`  Pool: ${best.pool}`);
-    console.log(`  Fee/TVL ratio: ${best.fee_tvl_ratio}`);
-    console.log(`  Volume 24h: $${best.volume_24h?.toLocaleString()}`);
+    console.log(`  Fee/active TVL ratio: ${best.fee_active_tvl_ratio}`);
+    console.log(`  Volume window: $${best.volume_window?.toLocaleString()}`);
     console.log(`  Active TVL: $${best.active_tvl?.toLocaleString()}`);
     console.log(`  Organic score: ${best.organic_score}`);
     console.log(`  Volatility: ${best.volatility}`);
     console.log(`  Active positions: ${best.active_pct}%`);
   }
 
-  // Test 2: Trending pools
+  // Test 2: Deterministic top candidates
+  console.log("\n\nFetching deterministic top candidates...");
+  const ranked = await getTopCandidates({ limit: 5 });
+  console.log(`Ranked ${ranked.total_eligible} eligible pools from ${ranked.total_screened} screened`);
+  if (ranked.candidates.length > 0) {
+    const bestRanked = ranked.candidates[0];
+    console.log(`  #1 ${bestRanked.name}`);
+    console.log(`  Ranking score: ${bestRanked.deterministic_score}`);
+    console.log(`  Base mint: ${bestRanked.base?.mint}`);
+  }
+
+  // Test 3: Trending pools
   console.log("\n\nFetching trending pools...");
   const trending = await discoverPools({ page_size: 5, timeframe: "1h", category: "trending" });
   console.log(`Found ${trending.pools.length} trending pools`);
 
-  // Test 3: Pool detail (if we have a pool address)
+  // Test 4: Pool detail (if we have a pool address)
   if (top.pools.length > 0) {
     const poolAddr = top.pools[0].pool;
     console.log(`\n\nFetching detail for ${poolAddr}...`);
@@ -53,6 +64,10 @@ async function main() {
   }
 
   console.log("\n=== Screening tests complete ===");
+  process.exit(0);
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
