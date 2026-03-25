@@ -12,9 +12,9 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
 
-const LESSONS_FILE = "./lessons.json";
+const LESSONS_FILE = process.env.ZENITH_LESSONS_FILE || "./lessons.json";
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 
@@ -61,6 +61,7 @@ export async function recordPerformance(perf) {
   const data = load();
 
   const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
+  const inventory_pnl_usd = perf.final_value_usd - perf.initial_value_usd;
   const pnl_pct = perf.initial_value_usd > 0
     ? (pnl_usd / perf.initial_value_usd) * 100
     : 0;
@@ -75,9 +76,15 @@ export async function recordPerformance(perf) {
   const entry = {
     ...perf,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
+    inventory_pnl_usd: Math.round(inventory_pnl_usd * 100) / 100,
+    fee_component_usd: Math.round((perf.fees_earned_usd || 0) * 100) / 100,
+    pnl_after_fees_usd: Math.round((inventory_pnl_usd + (perf.fees_earned_usd || 0)) * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     fee_yield_pct: Math.round(fee_yield_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
+    claim_count: perf.claim_count ?? 0,
+    rebalance_count: perf.rebalance_count ?? 0,
+    operational_touch_count: (perf.claim_count ?? 0) + (perf.rebalance_count ?? 0) + 1,
     token_type_distribution: tokenTypeDistribution,
     recorded_at: new Date().toISOString(),
   };
@@ -109,6 +116,9 @@ export async function recordPerformance(perf) {
       strategy: perf.strategy,
       volatility: perf.volatility,
       fee_yield_pct: entry.fee_yield_pct,
+      inventory_pnl_usd: entry.inventory_pnl_usd,
+      fee_component_usd: entry.fee_component_usd,
+      operational_touch_count: entry.operational_touch_count,
       token_type_distribution: tokenTypeDistribution.key,
     });
   }
@@ -242,48 +252,12 @@ export function evolveThresholds(perfData, config) {
   const changes   = {};
   const rationale = {};
 
-  // ── 1. maxVolatility ─────────────────────────────────────────
-  // If losers tend to cluster at higher volatility → tighten the ceiling.
-  // If winners span higher volatility safely → we can loosen a bit.
-  {
-    const winnerVols = winners.map((p) => p.volatility).filter(isFiniteNum);
-    const loserVols  = losers.map((p) => p.volatility).filter(isFiniteNum);
-    const current    = config.screening.maxVolatility;
-
-    if (loserVols.length >= 2) {
-      // 25th percentile of loser volatilities — this is where things start going wrong
-      const loserP25 = percentile(loserVols, 25);
-      if (loserP25 < current) {
-        // Tighten: new ceiling = loserP25 + a small buffer
-        const target  = loserP25 * 1.15;
-        const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 1.0, 20.0);
-        const rounded = Number(newVal.toFixed(1));
-        if (rounded < current) {
-          changes.maxVolatility = rounded;
-          rationale.maxVolatility = `Losers clustered at volatility ~${loserP25.toFixed(1)} — tightened from ${current} → ${rounded}`;
-        }
-      }
-    } else if (winnerVols.length >= 3 && losers.length === 0) {
-      // All winners so far — loosen conservatively so we don't miss good pools
-      const winnerP75 = percentile(winnerVols, 75);
-      if (winnerP75 > current * 1.1) {
-        const target  = winnerP75 * 1.1;
-        const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 1.0, 20.0);
-        const rounded = Number(newVal.toFixed(1));
-        if (rounded > current) {
-          changes.maxVolatility = rounded;
-          rationale.maxVolatility = `All ${winners.length} positions profitable — loosened from ${current} → ${rounded}`;
-        }
-      }
-    }
-  }
-
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 1. minFeeActiveTvlRatio ───────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio;
 
     if (winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
@@ -293,8 +267,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
@@ -309,16 +283,16 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
     }
   }
 
-  // ── 3. minOrganic ─────────────────────────────────────────────
+  // ── 2. minOrganic ─────────────────────────────────────────────
   // Raise organic floor if low-organic tokens consistently failed.
   {
     const loserOrganics  = losers.map((p) => p.organic_score).filter(isFiniteNum);
@@ -358,9 +332,8 @@ export function evolveThresholds(perfData, config) {
 
   // Apply to live config object immediately
   const s = config.screening;
-  if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
-  if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
+  if (changes.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic           != null) s.minOrganic           = changes.minOrganic;
 
   // Log a lesson summarizing the evolution
   const data = load();
@@ -644,8 +617,11 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
       pool: r.pool,
       strategy: r.strategy,
       pnl_usd: r.pnl_usd,
+      inventory_pnl_usd: r.inventory_pnl_usd,
+      fee_component_usd: r.fee_component_usd,
       pnl_pct: r.pnl_pct,
       fees_earned_usd: r.fees_earned_usd,
+      operational_touch_count: r.operational_touch_count,
       range_efficiency: r.range_efficiency,
       minutes_held: r.minutes_held,
       close_reason: r.close_reason,
@@ -674,15 +650,21 @@ export function getPerformanceSummary() {
   if (p.length === 0) return null;
 
   const totalPnl = p.reduce((s, x) => s + x.pnl_usd, 0);
+  const totalInventoryPnl = p.reduce((s, x) => s + (x.inventory_pnl_usd ?? 0), 0);
+  const totalFeeComponent = p.reduce((s, x) => s + (x.fee_component_usd ?? 0), 0);
   const avgPnlPct = p.reduce((s, x) => s + x.pnl_pct, 0) / p.length;
   const avgRangeEfficiency = p.reduce((s, x) => s + x.range_efficiency, 0) / p.length;
+  const avgOperationalTouches = p.reduce((s, x) => s + (x.operational_touch_count ?? 0), 0) / p.length;
   const wins = p.filter((x) => x.pnl_usd > 0).length;
 
   return {
     total_positions_closed: p.length,
     total_pnl_usd: Math.round(totalPnl * 100) / 100,
+    total_inventory_pnl_usd: Math.round(totalInventoryPnl * 100) / 100,
+    total_fee_component_usd: Math.round(totalFeeComponent * 100) / 100,
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
+    avg_operational_touch_count: Math.round(avgOperationalTouches * 10) / 10,
     win_rate_pct: Math.round((wins / p.length) * 100),
     total_lessons: data.lessons.length,
     token_type_distribution_success_rates: summarizeTokenTypeDistributions(p),

@@ -637,6 +637,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
+      base_mint: pool.lbPair.tokenXMint.toString(),
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step,
@@ -796,6 +797,9 @@ export async function getMyPositions({ force = false } = {}) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+    const mintMaps = await Promise.all(uniquePools.map((pool) => resolvePoolTokenMints(pool)));
+    const mintsByPool = {};
+    uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
@@ -815,6 +819,7 @@ export async function getMyPositions({ force = false } = {}) {
       const pnlPct        = p?.pnlPctChange ?? 0;
 
       const tracked = getTrackedPosition(r.position);
+      const poolMints = mintsByPool[r.pool] || null;
       const ageFromPnlApi = p?.createdAt
         ? Math.floor((Date.now() - p.createdAt * 1000) / 60000)
         : null;
@@ -834,7 +839,7 @@ export async function getMyPositions({ force = false } = {}) {
         volatility: r.volatility,
         organic_score: r.organic_score,
         instruction: r.instruction,
-        base_mint: r.base_mint,
+        base_mint: tracked?.base_mint || poolMints?.token_x_mint || r.base_mint,
         lower_bin: lowerBin,
         upper_bin: upperBin,
         active_bin: activeBin,
@@ -890,13 +895,18 @@ export async function getWalletPositions({ wallet_address }) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+    const mintMaps = await Promise.all(uniquePools.map((pool) => resolvePoolTokenMints(pool)));
+    const mintsByPool = {};
+    uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
+      const poolMints = mintsByPool[r.pool] || null;
 
       return {
         position:           r.position,
         pool:               r.pool,
+        base_mint:          poolMints?.token_x_mint || null,
         lower_bin:          p?.lowerBinId      ?? null,
         upper_bin:          p?.upperBinId      ?? null,
         active_bin:         p?.poolActiveBinId ?? null,
@@ -1722,6 +1732,10 @@ export async function autoCompoundFees({
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
+  const trackedPosition = getTrackedPosition(position_address);
+  if (trackedPosition?.closed) {
+    return { success: false, error: `Position ${position_address} is already closed` };
+  }
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
@@ -1761,8 +1775,12 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address }) {
+export async function closePosition({ position_address, reason = "agent decision" }) {
   position_address = normalizeMint(position_address);
+  const trackedPosition = getTrackedPosition(position_address);
+  if (trackedPosition?.closed) {
+    return { success: false, error: `Position ${position_address} is already closed` };
+  }
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
@@ -1814,7 +1832,7 @@ export async function closePosition({ position_address }) {
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    recordClose(position_address, "agent decision");
+    recordClose(position_address, reason);
 
     // Record performance for learning
     const tracked = getTrackedPosition(position_address);
@@ -1854,18 +1872,21 @@ export async function closePosition({ position_address }) {
         fee_tvl_ratio: tracked.fee_tvl_ratio || null,
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
+        base_mint: tracked.base_mint || pool.lbPair.tokenXMint.toString(),
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
-        close_reason: "agent decision",
+        claim_count: tracked.claim_count || 0,
+        rebalance_count: tracked.rebalance_count || 0,
+        close_reason: reason,
       });
 
-      return { success: true, position: position_address, pool: poolAddress, pool_name: tracked.pool_name || null, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct, base_mint: pool.lbPair.tokenXMint.toString() };
+      return { success: true, position: position_address, pool: poolAddress, pool_name: tracked.pool_name || null, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct, base_mint: pool.lbPair.tokenXMint.toString(), close_reason: reason };
     }
 
-    return { success: true, position: position_address, pool: poolAddress, pool_name: null, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return { success: true, position: position_address, pool: poolAddress, pool_name: null, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString(), close_reason: reason };
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };

@@ -111,6 +111,7 @@ export function trackPosition({
   position,
   pool,
   pool_name,
+  base_mint = null,
   strategy,
   bin_range = {},
   amount_sol,
@@ -127,6 +128,7 @@ export function trackPosition({
     position,
     pool,
     pool_name,
+    base_mint,
     strategy,
     bin_range,
     amount_sol,
@@ -142,6 +144,7 @@ export function trackPosition({
     out_of_range_since: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
+    claim_count: 0,
     rebalance_count: 0,
     peak_pnl_pct: 0,
     trailing_active: false,
@@ -203,6 +206,7 @@ export function recordClaim(position_address, fees_usd) {
   if (!pos) return;
   pos.last_claim_at = new Date().toISOString();
   pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
+   pos.claim_count = (pos.claim_count || 0) + 1;
   pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
   save(state);
 }
