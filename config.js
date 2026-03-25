@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
@@ -55,7 +56,11 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,
     trailingDropPct:       u.trailingDropPct       ?? 1.5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
-    minSolToOpen:          u.minSolToOpen          ?? 0.55,
+    minSolToOpen:          getEffectiveMinSolToOpen({
+      minSolToOpen: u.minSolToOpen ?? 0.55,
+      deployAmountSol: u.deployAmountSol ?? 0.5,
+      gasReserve: u.gasReserve ?? 0.2,
+    }),
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
