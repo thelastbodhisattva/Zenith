@@ -15,6 +15,7 @@ Implementation status updated: `2026-03-25`
 - **Manages positions actively** — monitors open positions, claims fees when justified, and rebalances out-of-range positions immediately when no higher-priority hard exit applies
 - **Learns from memory** — stores wallet-score memory per pool plus distribution success-rate memory from closed positions so later cycles can reuse what worked
 - **Runs as an operator-facing agent** — supports REPL and Telegram workflows for autonomous cycles, manual actions, and live status checks
+- **Surfaces cached LP performance** — uses a cached LP Agent overview for briefings and operator reporting without feeding that data back into execution policy
 
 ---
 
@@ -40,6 +41,7 @@ A third health check runs hourly to summarize portfolio state.
 - Screening prompts are intentionally slimmer: deterministic control signals stay visible, but narrative and memory context are truncated so the model sees less noise
 - Closed-position learning now records inventory-vs-fee contribution and operational touch counts so later evaluation is less likely to confuse extra actions with better outcomes
 - Threshold evolution now only mutates live screening keys that the runtime actually uses
+- Operator reporting can now combine local realized attribution with cached LP-overview summaries, while keeping execution decisions runtime-owned
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -170,6 +172,7 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/candidate <n>` | Inspect one ranked candidate with richer signals on demand |
 | `/evaluation` | Show recent cycle/tool evaluation summaries |
 | `/performance` | Show recent closed-position attribution and history |
+| `/briefing` | Show a daily briefing that now prefers cached LP-overview metrics when available |
 | `/learn` | Study top LPers across current candidate pools and save lessons |
 | `/learn <pool_address>` | Study top LPers for one specific pool |
 | `<wallet_address>` | Inspect a wallet's positions or a pool's LP-wallet context |
@@ -227,6 +230,14 @@ Zenith now also keeps bounded evaluation summaries in local state: recent manage
 
 Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
 
+### LP overview reporting
+
+Zenith now includes a cached LP Agent overview helper for operator-facing visibility. This data is used in briefings and `/performance` output as an external reference layer, not as a hidden execution-policy input.
+
+- Cached view of total PnL, total fees, open/closed positions, win rate, average hold time, and ROI
+- Falls back to local lesson/performance summaries if LP Agent data is unavailable
+- Stays read-only and bounded so it improves visibility without creating a second control plane
+
 ### Candidate quality gates
 
 Holder-quality checks now rely on stronger signals such as `common_funder` and `funded_same_window`. The older `similar_amount` heuristic was removed because it over-flagged legitimate small holders at top-100 scale.
@@ -254,6 +265,7 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `prompt.test.js` — prompt/runtime contract expectations
 - `lessons.test.js` — threshold-evolution key alignment and attribution summaries
 - `runtime-policy.test.js` — runtime management policy decisions
+- `test/test-runtime-fixes.js` — pure helper checks for required SOL floors and canonical screening-threshold summaries
 
 Smoke scripts still exist for screening and startup, but the focused tests are the stronger signal for the deterministic control plane.
 

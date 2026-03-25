@@ -6,6 +6,9 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-25
 
+- Added a low-bloat cached LP-overview helper for operator-facing reporting, with bounded integration into briefings and `/performance` output only.
+- Added `runtime-helpers.js` to centralize pure deterministic utility logic such as effective SOL floor calculation and canonical screening-threshold summaries.
+- Added provider-free helper regression coverage in `test/test-runtime-fixes.js`.
 - Hardened staged screening so the bot cheap-ranks a wider candidate set, surfaces a deterministic shortlist, and deeply enriches only the strongest finalists.
 - Shifted more management behavior into deterministic runtime policy so obvious close / rebalance / fee-threshold actions are resolved before the LLM is asked to reason.
 - Added richer operator-facing reporting with `/candidate <n>`, `/evaluation`, and `/performance` surfaces for finalist inspection, cycle telemetry, and closed-position attribution.
