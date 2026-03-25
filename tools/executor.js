@@ -400,7 +400,7 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check position count limit + duplicate pool guard
-      const positions = await getMyPositions();
+      const positions = await getMyPositions({ force: true });
       if (positions.total_positions >= config.risk.maxPositions) {
         return {
           pass: false,
@@ -482,6 +482,27 @@ async function runSafetyChecks(name, args) {
           reason: "position_address is required.",
         };
       }
+      return { pass: true };
+    }
+
+    case "claim_fees":
+    case "close_position": {
+      if (!args?.position_address) {
+        return {
+          pass: false,
+          reason: "position_address is required.",
+        };
+      }
+
+      const positions = await getMyPositions({ force: true });
+      const openPosition = positions.positions?.find((position) => position.position === args.position_address);
+      if (!openPosition) {
+        return {
+          pass: false,
+          reason: `Position ${args.position_address} is not currently open.`,
+        };
+      }
+
       return { pass: true };
     }
 

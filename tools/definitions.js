@@ -321,6 +321,10 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
             type: "string",
             description: "The position public key to close"
           },
+          reason: {
+            type: "string",
+            description: "Optional close reason for performance/accounting records"
+          },
           skip_swap: {
             type: "boolean",
             description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
