@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -21,6 +22,32 @@ function ask(question, defaultVal) {
     rl.question(`${question}${hint}: `, (ans) => {
       const trimmed = ans.trim();
       resolve(trimmed === "" ? defaultVal : trimmed);
+    });
+  });
+}
+
+function askSecret(question, { hasExisting = false } = {}) {
+  return new Promise((resolve) => {
+    const hint = hasExisting ? " (leave blank to keep existing value)" : "";
+    const originalWrite = rl._writeToOutput;
+    rl.stdoutMuted = true;
+    rl._writeToOutput = function writeMasked(stringToWrite) {
+      if (!rl.stdoutMuted) {
+        originalWrite.call(rl, stringToWrite);
+        return;
+      }
+      if (stringToWrite.includes(": ")) {
+        originalWrite.call(rl, stringToWrite);
+        return;
+      }
+      originalWrite.call(rl, "*");
+    };
+
+    rl.question(`${question}${hint}: `, (ans) => {
+      rl.stdoutMuted = false;
+      rl._writeToOutput = originalWrite;
+      process.stdout.write("\n");
+      resolve(ans.trim());
     });
   });
 }
@@ -136,10 +163,8 @@ const rpcUrl = await ask(
   e("rpcUrl", process.env.RPC_URL || "https://api.mainnet-beta.solana.com")
 );
 
-const walletKey = await ask(
-  "Wallet private key (base58)",
-  e("walletKey", process.env.WALLET_PRIVATE_KEY ? "*** (already set in .env)" : "")
-);
+const existingWalletKey = existing.walletKey || process.env.WALLET_PRIVATE_KEY || "";
+const walletKey = await askSecret("Wallet private key (base58)", { hasExisting: Boolean(existingWalletKey) });
 
 // ─── Deployment ───────────────────────────────────────────────────────────────
 console.log("\n── Deployment ────────────────────────────────");
@@ -158,7 +183,7 @@ const maxPositions = await askNum(
 
 const minSolToOpen = await askNum(
   "Min SOL balance to open a new position",
-  e("minSolToOpen", parseFloat((deployAmountSol + 0.05).toFixed(3))),
+  e("minSolToOpen", getEffectiveMinSolToOpen({ minSolToOpen: 0.55, deployAmountSol, gasReserve: 0.2 })),
   { min: 0.05 }
 );
 
@@ -255,7 +280,7 @@ rl.close();
 const userConfig = {
   preset: presetChoice.key,
   rpcUrl,
-  ...(walletKey && !walletKey.startsWith("***") ? { walletKey } : {}),
+  ...(walletKey ? { walletKey } : existing.walletKey ? { walletKey: existing.walletKey } : {}),
   deployAmountSol,
   maxPositions,
   minSolToOpen,

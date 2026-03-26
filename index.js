@@ -1136,7 +1136,7 @@ Commands:
         const pool = startupCandidates[pick - 1];
         console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}) using deploy_position directly. Report result.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1152,7 +1152,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
