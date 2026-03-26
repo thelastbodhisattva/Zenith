@@ -6,6 +6,10 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-26
 
+- Removed redundant deploy choreography by stopping the requirement to pre-call `get_active_bin` before `deploy_position` when no standalone bin inspection is needed.
+- Hardened deploy-time basis data so `initial_value_usd` is treated as required evaluation input, with a bounded SOL-leg fallback for legacy callers.
+- Replaced the blunt fixed post-close wait with a bounded settlement check/polling path to reduce stale-balance races more safely.
+- Masked wallet private key entry in the interactive setup flow instead of echoing secrets in plain text.
 - Added explicit runtime management subreason codes so deterministic actions are easier to inspect and test.
 - Added explicit out-of-range direction tracking (`above` / `below`) to position state and operator-facing reporting.
 - Added a short-lived discovery/startup cache to reduce bursty hot-path fetches for screening and operator commands.

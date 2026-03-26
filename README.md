@@ -45,7 +45,9 @@ A third health check runs hourly to summarize portfolio state.
 - Screening now has an exact pre-LLM skip for the real empty-shortlist case: if deterministic filters produce no eligible candidates, the cycle records `skipped_no_candidates` and does not invoke the model
 - Startup, `/status`, and `/candidates` now reuse a short-lived startup snapshot instead of bursty repeated fetches
 - Open-position state now tracks explicit out-of-range direction (`above` / `below`) for clearer operator reporting and postmortems
-- Post-close handling now includes a short settlement wait before downstream accounting continues, reducing stale-balance races after close transactions
+- Post-close handling now uses a bounded settlement check instead of a blind fixed sleep, reducing stale-balance races after close transactions
+- `deploy_position` no longer depends on redundant `get_active_bin` choreography and now backfills deploy-time USD basis data when only the SOL leg is known
+- Setup input now masks wallet private key entry instead of echoing secrets in plain text
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -247,6 +249,14 @@ Zenith now includes a cached LP Agent overview helper for operator-facing visibi
 ### Candidate quality gates
 
 Holder-quality checks now rely on stronger signals such as `common_funder` and `funded_same_window`. The older `similar_amount` heuristic was removed because it over-flagged legitimate small holders at top-100 scale.
+
+### Deploy basis and action contracts
+
+Zenith now hardens deploy-time evaluation inputs and action contracts a little more aggressively:
+
+- `deploy_position` treats `initial_value_usd` as required basis data for evaluation, but still backfills a bounded estimate from the SOL leg for legacy callers
+- operator/agent prompts no longer require redundant `get_active_bin` choreography before `deploy_position`, because the tool already fetches the active bin internally
+- runtime close / rebalance / fee actions now expose explicit subreason codes, making action attribution easier to inspect and test
 
 ---
 
