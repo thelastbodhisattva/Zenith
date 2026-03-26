@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-25`
+Implementation status updated: `2026-03-26`
 
 ---
 
@@ -42,6 +42,10 @@ A third health check runs hourly to summarize portfolio state.
 - Closed-position learning now records inventory-vs-fee contribution and operational touch counts so later evaluation is less likely to confuse extra actions with better outcomes
 - Threshold evolution now only mutates live screening keys that the runtime actually uses
 - Operator reporting can now combine local realized attribution with cached LP-overview summaries, while keeping execution decisions runtime-owned
+- Screening now has an exact pre-LLM skip for the real empty-shortlist case: if deterministic filters produce no eligible candidates, the cycle records `skipped_no_candidates` and does not invoke the model
+- Startup, `/status`, and `/candidates` now reuse a short-lived startup snapshot instead of bursty repeated fetches
+- Open-position state now tracks explicit out-of-range direction (`above` / `below`) for clearer operator reporting and postmortems
+- Post-close handling now includes a short settlement wait before downstream accounting continues, reducing stale-balance races after close transactions
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -227,6 +231,8 @@ Strategy memory no longer depends only on exact `strategy + bin step` pairings. 
 `/learn` still supports deeper top-LPer study for qualitative lessons, while `/evolve` updates screening thresholds from closed-position history. Those lessons and evolved thresholds are fed back into future cycles without requiring a restart.
 
 Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, and compact counters such as candidates scored, candidates blocked, runtime actions handled, and write-tool blocks/errors. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
+
+Management runtime actions also expose explicit subreason codes (for example stop loss, take profit, low fee yield, fee threshold, or out-of-range rebalance) so operator-facing reports and tests can describe *why* runtime acted without widening prompt-owned policy.
 
 Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
 

@@ -4,6 +4,15 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-26
+
+- Added explicit runtime management subreason codes so deterministic actions are easier to inspect and test.
+- Added explicit out-of-range direction tracking (`above` / `below`) to position state and operator-facing reporting.
+- Added a short-lived discovery/startup cache to reduce bursty hot-path fetches for screening and operator commands.
+- Added an exact pre-LLM skip for the no-candidate hole: when deterministic screening yields no shortlist, the cycle is recorded as `skipped_no_candidates` without invoking the model.
+- Added a short post-close settlement wait before downstream accounting continues, reducing stale-balance races after close transactions.
+- Added focused regression coverage for subreason codes, out-of-range direction tracking, and discovery-cache reuse (`runtime-policy.test.js`, `state.test.js`, `tools/screening.test.js`).
+
 ### 2026-03-25
 
 - Added a low-bloat cached LP-overview helper for operator-facing reporting, with bounded integration into briefings and `/performance` output only.
