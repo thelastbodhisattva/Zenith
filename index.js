@@ -4,7 +4,7 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getPositionPnl } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { discoverPools, getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, secretHealth } from "./config.js";
 import { evolveThresholds, getPerformanceHistory, getPerformanceSummary, getStrategyProofSummary } from "./lessons.js";
 import { getScreeningThresholdSummary } from "./runtime-helpers.js";
@@ -13,7 +13,7 @@ import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isE
 import { generateBriefing } from "./briefing.js";
 import { getEvaluationSummary, getLastBriefingDate, getTrackedPositions, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
+import { getNegativeRegimeCooldown, recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { initMemory, recallForManagement } from "./memory.js";
 import { classifyManagementModelGate, deriveExpectedVolumeProfile, isPnlSignalStale, resolveTargetManagementInterval } from "./runtime-policy.js";
 import { getLpOverview } from "./tools/lp-overview.js";
@@ -30,6 +30,7 @@ import { acknowledgeRecoveryResume, armGeneralWriteTools, disarmGeneralWriteTool
 import { updateRuntimeHealth } from "./runtime-health.js";
 import { formatReplayReview, getReplayEnvelope, getReplayReview, getReplayReviewStats } from "./replay-review.js";
 import { listActionJournalEntries } from "./action-journal.js";
+import { getNegativeRegimeMemory } from "./negative-regime-memory.js";
 import { handleOperatorCommandText } from "./operator-command-handlers.js";
 import {
   buildOperationalHealthReport,
@@ -56,6 +57,16 @@ import { createManagementCycleRunner } from "./management-cycle-runner.js";
 import { createScreeningCycleRunner } from "./screening-cycle-runner.js";
 import { runInteractiveInterface } from "./interactive-interface.js";
 import { runNonInteractiveStartup } from "./startup-interface.js";
+import {
+  applyRegimeHysteresis,
+  classifyRuntimeRegime,
+  getRegimePack,
+  getPerformanceSizingMultiplier,
+  getRiskSizingMultiplier,
+  listCounterfactualRegimes,
+  resolveRegimePackContext,
+} from "./regime-packs.js";
+import { appendCounterfactualReview } from "./counterfactual-review.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -245,6 +256,7 @@ export function startCronJobs() {
     config,
     getMyPositions,
     getWalletBalances,
+    discoverPools,
     getTopCandidates,
     classifyRuntimeFailure,
     validateStartupSnapshot,
@@ -263,6 +275,17 @@ export function startCronJobs() {
     roundMetric,
     agentLoop,
     evaluatePortfolioGuard,
+    getPerformanceSummary,
+    classifyRuntimeRegime,
+    applyRegimeHysteresis,
+    resolveRegimePackContext,
+    listCounterfactualRegimes,
+    getRegimePack,
+    getPerformanceSizingMultiplier,
+    getRiskSizingMultiplier,
+    getNegativeRegimeCooldown,
+    getNegativeRegimeMemory,
+    appendCounterfactualReview,
     recordCycleEvaluation,
     refreshRuntimeHealth,
     telegramEnabled,

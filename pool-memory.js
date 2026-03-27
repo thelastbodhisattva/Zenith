@@ -10,6 +10,8 @@ import { log } from "./logger.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
 const LOW_YIELD_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+const NEGATIVE_REGIME_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const NEGATIVE_REGIME_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000;
 export const CANONICAL_LOW_YIELD_REASON = "fee yield too low";
 
 function createPoolEntry(name, baseMint = null) {
@@ -27,6 +29,7 @@ function createPoolEntry(name, baseMint = null) {
     token_type_distribution_stats: {},
     low_yield_cooldown_until: null,
     low_yield_cooldown_reason: null,
+    negative_regime_cooldowns: {},
   };
 }
 
@@ -41,9 +44,125 @@ function ensurePoolEntry(db, poolAddress, seed = {}) {
   if (!db[poolAddress].token_type_distribution_stats) db[poolAddress].token_type_distribution_stats = {};
   if (!Object.hasOwn(db[poolAddress], "low_yield_cooldown_until")) db[poolAddress].low_yield_cooldown_until = null;
   if (!Object.hasOwn(db[poolAddress], "low_yield_cooldown_reason")) db[poolAddress].low_yield_cooldown_reason = null;
+  if (!db[poolAddress].negative_regime_cooldowns || typeof db[poolAddress].negative_regime_cooldowns !== "object") {
+    db[poolAddress].negative_regime_cooldowns = {};
+  }
   if (!db[poolAddress].name) db[poolAddress].name = seed.name || poolAddress.slice(0, 8);
   if (!db[poolAddress].base_mint && seed.base_mint) db[poolAddress].base_mint = seed.base_mint;
   return db[poolAddress];
+}
+
+export function buildNegativeRegimeCooldownKey({ regime_label, strategy }) {
+  const regime = String(regime_label || "neutral").trim().toLowerCase() || "neutral";
+  const strategyName = String(strategy || "unknown").trim().toLowerCase() || "unknown";
+  return `${regime}|${strategyName}`;
+}
+
+function shouldRecordNegativeRegimeCooldown(deploy) {
+  const pnlPct = Number(deploy.pnl_pct);
+  if (Number.isFinite(pnlPct) && pnlPct <= -5) return true;
+
+  const reason = normalizeReason(deploy.close_reason);
+  return reason.includes("stop loss") || reason.includes("fee yield too low") || reason.includes("volume collapse");
+}
+
+function recordNegativeRegimeCooldown(entry, deploy, nowMs = Date.now()) {
+  if (!shouldRecordNegativeRegimeCooldown(deploy)) return;
+
+  const key = buildNegativeRegimeCooldownKey({
+    regime_label: deploy.regime_label,
+    strategy: deploy.strategy,
+  });
+
+  const existing = entry.negative_regime_cooldowns[key];
+  const existingHits = Number(existing?.hits) || 0;
+  const nextHits = Math.max(1, existingHits + 1);
+  const durationMs = Math.min(
+    NEGATIVE_REGIME_COOLDOWN_MAX_MS,
+    NEGATIVE_REGIME_COOLDOWN_MS + ((nextHits - 1) * 2 * 60 * 60 * 1000),
+  );
+
+  entry.negative_regime_cooldowns[key] = {
+    key,
+    regime_label: deploy.regime_label || "neutral",
+    strategy: deploy.strategy || "unknown",
+    hits: nextHits,
+    cooldown_until: new Date(nowMs + durationMs).toISOString(),
+    reason: `negative outcome: ${deploy.close_reason || "loss"}`,
+    last_recorded_at: deploy.closed_at || new Date(nowMs).toISOString(),
+    last_pnl_pct: Number.isFinite(Number(deploy.pnl_pct)) ? Number(deploy.pnl_pct) : null,
+  };
+}
+
+export function getNegativeRegimeCooldown({
+  pool_address,
+  regime_label = "neutral",
+  strategy,
+  nowMs = Date.now(),
+} = {}) {
+  if (!pool_address) {
+    return {
+      pool_address: null,
+      key: null,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+      hits: 0,
+    };
+  }
+
+  const db = load();
+  const entry = db[pool_address];
+  if (!entry?.negative_regime_cooldowns) {
+    return {
+      pool_address,
+      key: null,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+      hits: 0,
+    };
+  }
+
+  const key = buildNegativeRegimeCooldownKey({ regime_label, strategy });
+  const cooldown = entry.negative_regime_cooldowns[key];
+  if (!cooldown?.cooldown_until) {
+    return {
+      pool_address,
+      key,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+      hits: 0,
+    };
+  }
+
+  const cooldownUntilMs = Date.parse(cooldown.cooldown_until);
+  if (!Number.isFinite(cooldownUntilMs)) {
+    return {
+      pool_address,
+      key,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+      hits: Number(cooldown.hits) || 0,
+    };
+  }
+
+  const remainingMs = Math.max(0, cooldownUntilMs - nowMs);
+  return {
+    pool_address,
+    key,
+    active: remainingMs > 0,
+    cooldown_until: cooldown.cooldown_until,
+    remaining_ms: remainingMs,
+    reason: cooldown.reason || "negative regime cooldown",
+    hits: Number(cooldown.hits) || 0,
+  };
 }
 
 function normalizeReason(reason) {
@@ -200,6 +319,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
     volatility_at_deploy: deployData.volatility ?? null,
     fee_yield_pct: deployData.fee_yield_pct ?? null,
     token_type_distribution: deployData.token_type_distribution || null,
+    regime_label: deployData.regime_label || "neutral",
   };
 
   entry.deploys.push(deploy);
@@ -228,6 +348,8 @@ export function recordPoolDeploy(poolAddress, deployData) {
     entry.low_yield_cooldown_until = new Date(Date.now() + LOW_YIELD_COOLDOWN_MS).toISOString();
     entry.low_yield_cooldown_reason = CANONICAL_LOW_YIELD_REASON;
   }
+
+  recordNegativeRegimeCooldown(entry, deploy);
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
@@ -265,6 +387,7 @@ export function getPoolMemory({ pool_address }) {
     last_outcome: entry.last_outcome,
     notes: entry.notes,
     token_type_distribution_stats: entry.token_type_distribution_stats || {},
+    negative_regime_cooldowns: entry.negative_regime_cooldowns || {},
     history: entry.deploys.slice(-10), // last 10 deploys
   };
 }

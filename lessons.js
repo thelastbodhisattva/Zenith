@@ -10,13 +10,19 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { inferPerformanceRegimeSignal } from "./regime-packs.js";
+import { recordNegativeRegimeOutcome } from "./negative-regime-memory.js";
+import { attachCounterfactualRealizedOutcome } from "./counterfactual-review.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
 
 const LESSONS_FILE = process.env.ZENITH_LESSONS_FILE || "./lessons.json";
+const THRESHOLD_ROLLOUT_FILE = process.env.ZENITH_THRESHOLD_ROLLOUT_FILE || "./threshold-rollout.json";
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
+const MIN_ROLLOUT_CLOSES = 5;
+const ROLLOUT_MAX_HISTORY = 25;
 
 function load() {
   if (!fs.existsSync(LESSONS_FILE)) {
@@ -120,8 +126,25 @@ export async function recordPerformance(perf) {
       fee_component_usd: entry.fee_component_usd,
       operational_touch_count: entry.operational_touch_count,
       token_type_distribution: tokenTypeDistribution.key,
+      regime_label: perf.regime_label || inferPerformanceRegimeSignal(perf),
     });
   }
+
+  recordNegativeRegimeOutcome({
+    regime_label: perf.regime_label || inferPerformanceRegimeSignal(perf),
+    strategy: perf.strategy,
+    pnl_pct: entry.pnl_pct,
+    close_reason: perf.close_reason,
+  });
+
+  attachCounterfactualRealizedOutcome({
+    pool_address: perf.pool,
+    regime_label: perf.regime_label || inferPerformanceRegimeSignal(perf),
+    pnl_pct: entry.pnl_pct,
+    pnl_usd: entry.pnl_usd,
+    close_reason: perf.close_reason,
+    closed_at: entry.recorded_at,
+  });
 
   // Mirror generalized strategy outcomes into fuzzy memory.
   try {
@@ -157,9 +180,11 @@ export async function recordPerformance(perf) {
   if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
     const { config, reloadScreeningThresholds } = await import("./config.js");
     const result = evolveThresholds(data.performance, config);
-    if (result?.changes && Object.keys(result.changes).length > 0) {
+    if (result?.requires_reload || (result?.changes && Object.keys(result.changes).length > 0)) {
       reloadScreeningThresholds();
-      log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
+      if (result?.changes && Object.keys(result.changes).length > 0) {
+        log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
+      }
     }
   }
 
@@ -231,6 +256,139 @@ function derivLesson(perf) {
 
 // ─── Adaptive Threshold Evolution ──────────────────────────────
 
+function loadThresholdRolloutState() {
+  if (!fs.existsSync(THRESHOLD_ROLLOUT_FILE)) {
+    return { active: null, history: [] };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(THRESHOLD_ROLLOUT_FILE, "utf8"));
+    return {
+      active: parsed?.active || null,
+      history: Array.isArray(parsed?.history) ? parsed.history : [],
+    };
+  } catch {
+    return { active: null, history: [] };
+  }
+}
+
+function saveThresholdRolloutState(state) {
+  fs.writeFileSync(THRESHOLD_ROLLOUT_FILE, JSON.stringify({
+    active: state?.active || null,
+    history: Array.isArray(state?.history) ? state.history.slice(-ROLLOUT_MAX_HISTORY) : [],
+  }, null, 2));
+}
+
+export function getThresholdRolloutState() {
+  return loadThresholdRolloutState();
+}
+
+function getPerformanceSnapshot(perfRows) {
+  if (!Array.isArray(perfRows) || perfRows.length === 0) {
+    return {
+      closes: 0,
+      avg_pnl_pct: 0,
+      win_rate_pct: 0,
+    };
+  }
+
+  const closes = perfRows.length;
+  const avgPnlPct = perfRows.reduce((sum, row) => sum + (Number(row.pnl_pct) || 0), 0) / closes;
+  const wins = perfRows.filter((row) => (Number(row.pnl_pct) || 0) >= 0).length;
+
+  return {
+    closes,
+    avg_pnl_pct: Number(avgPnlPct.toFixed(2)),
+    win_rate_pct: Number(((wins / closes) * 100).toFixed(2)),
+  };
+}
+
+function writeScreeningKeysToUserConfig(values) {
+  let userConfig = {};
+  if (fs.existsSync(USER_CONFIG_PATH)) {
+    try {
+      userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+    } catch {
+      userConfig = {};
+    }
+  }
+
+  Object.assign(userConfig, values);
+  userConfig._lastEvolved = new Date().toISOString();
+  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+}
+
+function applyScreeningChangesToConfig(config, values) {
+  const s = config.screening;
+  if (values.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = values.minFeeActiveTvlRatio;
+  if (values.minOrganic != null) s.minOrganic = values.minOrganic;
+}
+
+function evaluatePendingThresholdRollout(perfData, config) {
+  const rollout = loadThresholdRolloutState();
+  if (!rollout.active) return null;
+
+  const active = rollout.active;
+  const closesSinceStart = Math.max(0, perfData.length - (active.start_positions_count || 0));
+  const minClosesRequired = Number(active.min_closes_required) || MIN_ROLLOUT_CLOSES;
+
+  if (closesSinceStart < minClosesRequired) {
+    return {
+      status: "pending",
+      closes_since_start: closesSinceStart,
+      min_closes_required: minClosesRequired,
+      requires_reload: false,
+    };
+  }
+
+  const postSlice = perfData.slice(active.start_positions_count);
+  const post = getPerformanceSnapshot(postSlice);
+  const baseline = active.baseline || getPerformanceSnapshot([]);
+
+  const degradedAvgPnl = post.avg_pnl_pct < (baseline.avg_pnl_pct - 1);
+  const degradedWinRate = post.win_rate_pct < (baseline.win_rate_pct - 10);
+  const rollback = degradedAvgPnl || degradedWinRate;
+
+  const decision = {
+    rollout_id: active.rollout_id,
+    evaluated_at: new Date().toISOString(),
+    status: rollback ? "rolled_back" : "accepted",
+    changed_keys: active.changed_keys || [],
+    baseline,
+    post,
+    closes_since_start: closesSinceStart,
+    rollback_reason: rollback
+      ? `${degradedAvgPnl ? "avg_pnl_degraded" : ""}${degradedAvgPnl && degradedWinRate ? "+" : ""}${degradedWinRate ? "win_rate_degraded" : ""}`
+      : null,
+  };
+
+  if (rollback) {
+    writeScreeningKeysToUserConfig(active.previous_values || {});
+    applyScreeningChangesToConfig(config, active.previous_values || {});
+  }
+
+  rollout.history.push({
+    ...active,
+    ...decision,
+  });
+  rollout.active = null;
+  saveThresholdRolloutState(rollout);
+
+  const data = load();
+  data.lessons.push({
+    id: Date.now(),
+    rule: `[AUTO-EVOLUTION ${decision.status.toUpperCase()}] ${decision.changed_keys.join(", ")} | baseline avg=${baseline.avg_pnl_pct}% win=${baseline.win_rate_pct}% -> post avg=${post.avg_pnl_pct}% win=${post.win_rate_pct}%${decision.rollback_reason ? ` | reason=${decision.rollback_reason}` : ""}`,
+    tags: ["evolution", rollback ? "rollback" : "accepted"],
+    outcome: "manual",
+    created_at: new Date().toISOString(),
+  });
+  save(data);
+
+  return {
+    ...decision,
+    requires_reload: rollback,
+  };
+}
+
 /**
  * Analyze closed position performance and evolve screening thresholds.
  * Writes changes to user-config.json and returns a summary.
@@ -241,6 +399,39 @@ function derivLesson(perf) {
  */
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
+
+  const rolloutDecision = evaluatePendingThresholdRollout(perfData, config);
+  if (rolloutDecision?.status === "pending") {
+    return {
+      changes: {},
+      rationale: {},
+      rollout: rolloutDecision,
+      requires_reload: false,
+    };
+  }
+
+  if (rolloutDecision?.status === "accepted" || rolloutDecision?.status === "rolled_back") {
+    return {
+      changes: {},
+      rationale: {},
+      rollout: rolloutDecision,
+      requires_reload: Boolean(rolloutDecision.requires_reload),
+    };
+  }
+
+  const rolloutState = loadThresholdRolloutState();
+  if (rolloutState.active) {
+    return {
+      changes: {},
+      rationale: {},
+      rollout: {
+        status: "pending",
+        closes_since_start: Math.max(0, perfData.length - (rolloutState.active.start_positions_count || 0)),
+        min_closes_required: Number(rolloutState.active.min_closes_required) || MIN_ROLLOUT_CLOSES,
+      },
+      requires_reload: false,
+    };
+  }
 
   const winners = perfData.filter((p) => p.pnl_pct > 0);
   const losers  = perfData.filter((p) => p.pnl_pct < -5);
@@ -316,24 +507,43 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  if (Object.keys(changes).length === 0) return { changes: {}, rationale: {} };
-
-  // ── Persist changes to user-config.json ───────────────────────
-  let userConfig = {};
-  if (fs.existsSync(USER_CONFIG_PATH)) {
-    try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /* ignore */ }
+  if (Object.keys(changes).length === 0) {
+    return {
+      changes: {},
+      rationale: {},
+      requires_reload: false,
+    };
   }
 
-  Object.assign(userConfig, changes);
-  userConfig._lastEvolved = new Date().toISOString();
-  userConfig._positionsAtEvolution = perfData.length;
+  const previousValues = {};
+  for (const key of Object.keys(changes)) {
+    previousValues[key] = config.screening[key];
+  }
 
-  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+  // ── Persist changes to user-config.json ───────────────────────
+  writeScreeningKeysToUserConfig({
+    ...changes,
+    _positionsAtEvolution: perfData.length,
+  });
 
   // Apply to live config object immediately
-  const s = config.screening;
-  if (changes.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
-  if (changes.minOrganic           != null) s.minOrganic           = changes.minOrganic;
+  applyScreeningChangesToConfig(config, changes);
+
+  const baselineSnapshot = getPerformanceSnapshot(perfData.slice(-MIN_EVOLVE_POSITIONS));
+  const rolloutId = `${Date.now()}-${Object.keys(changes).join("_")}`;
+  saveThresholdRolloutState({
+    active: {
+      rollout_id: rolloutId,
+      started_at: new Date().toISOString(),
+      start_positions_count: perfData.length,
+      min_closes_required: MIN_ROLLOUT_CLOSES,
+      changed_keys: Object.keys(changes),
+      previous_values: previousValues,
+      new_values: changes,
+      baseline: baselineSnapshot,
+    },
+    history: rolloutState.history || [],
+  });
 
   // Log a lesson summarizing the evolution
   const data = load();
@@ -346,7 +556,17 @@ export function evolveThresholds(perfData, config) {
   });
   save(data);
 
-  return { changes, rationale };
+  return {
+    changes,
+    rationale,
+    rollout: {
+      status: "started",
+      rollout_id: rolloutId,
+      changed_keys: Object.keys(changes),
+      min_closes_required: MIN_ROLLOUT_CLOSES,
+    },
+    requires_reload: true,
+  };
 }
 
 // ─── Helpers ───────────────────────────────────────────────────

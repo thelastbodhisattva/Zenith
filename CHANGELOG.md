@@ -6,6 +6,12 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-27
 
+- Added a bounded adaptation layer with `regime-packs.js`, `negative-regime-memory.js`, and `counterfactual-review.js`, plus rollout-based threshold evolution in `lessons.js`.
+- Screening now applies fixed regime-conditioned parameter packs deterministically and uses adaptive deploy sizing under hard reserve/floor/cap rules.
+- Threshold evolution now records rollout metadata and can auto-rollback degraded screening changes instead of ratcheting them permanently.
+- Added dwell/decay hysteresis to regime switching so pack selection does not bounce too quickly on marginal cycle inputs.
+- Added cross-pool negative regime cooldown memory with stronger sample-quality gating, so repeated bad regime/strategy combinations must accumulate enough evidence before they block screening.
+- Added observational counterfactual review records for alternate regime packs, plus realized-outcome usefulness hints once the active choice later closes.
 - Added a lean elite-ops layer with `portfolio-guards.js`, `runtime-health.js`, `replay-review.js`, and `operator-controls.js` to extend Zenith beyond basic runtime hardening without adding a dashboard or second control plane.
 - Added portfolio-level autonomous trading pauses based on recent realized loss, stop-loss streaks, broader equity drawdown, and open-position unrealized loss, with deploy/rebalance enforcement at executor and DLMM boundaries.
 - Added runbook-grade operator commands for `/health`, `/journal`, `/failure <id>`, `/replay <cycle_id>`, `/reconcile <cycle_id>`, `/review`, `/resume <why>`, `/arm`, and `/disarm`.

@@ -47,7 +47,7 @@ npm run test:agent
 ## Latest local verification pass
 
 - `npm run test:hardening` — passed on `2026-03-27`
-  - `test:hardening:core`: 81 tests passed, 0 failed
+  - `test:hardening:core`: 92 tests passed, 0 failed
   - `test:hardening:drills`: `test/test-executor-boundary.js`, `test/test-operator-drill.js`, and `test/test-chaos-drill.js` passed
   - `test:hardening:startup`: `test/test-dry-run-startup.js` passed
 - `npm run test:screen` — passed on `2026-03-27`

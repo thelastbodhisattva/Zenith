@@ -174,3 +174,55 @@ test("rankCandidateSnapshots includes token-age blocked summary reasons", () => 
     config.screening.maxTokenAgeHours = originalMax;
   }
 });
+
+test("evaluateCandidateSnapshot respects per-call screeningConfig overrides", () => {
+  const pool = buildPool({
+    pool: "pool-override",
+    baseMint: "mint-override",
+    organic_score: 62,
+    holders: 750,
+    volume_window: 900,
+  });
+
+  const strict = evaluateCandidateSnapshot(pool, {
+    screeningConfig: {
+      ...config.screening,
+      minOrganic: 80,
+      minVolume: 5000,
+      minHolders: 1500,
+    },
+  });
+
+  const relaxed = evaluateCandidateSnapshot(pool, {
+    screeningConfig: {
+      ...config.screening,
+      minOrganic: 55,
+      minVolume: 500,
+      minHolders: 400,
+    },
+  });
+
+  assert.ok(relaxed.deterministic_score > strict.deterministic_score);
+});
+
+test("rankCandidateSnapshots applies external hard block policy deterministically", () => {
+  const ranked = rankCandidateSnapshots([
+    buildPool({ pool: "pool-cooldown", baseMint: "mint-cooldown" }),
+    buildPool({ pool: "pool-open", baseMint: "mint-open", organic_score: 90 }),
+  ], {
+    evaluationContext: {
+      extraHardBlockFn: (pool) => {
+        if (pool.pool !== "pool-cooldown") return null;
+        return {
+          blocked: true,
+          reason: "negative_regime_cooldown",
+          penalty_score: 50,
+        };
+      },
+    },
+  });
+
+  assert.equal(ranked.total_eligible, 1);
+  assert.equal(ranked.blocked_summary.negative_regime_cooldown, 1);
+  assert.equal(ranked.candidates[0].pool, "pool-open");
+});

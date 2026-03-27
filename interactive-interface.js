@@ -462,6 +462,24 @@ export async function runInteractiveInterface({
         console.log(`  fail_closed: ${stats.fail_closed}`);
         console.log(`  matches: ${stats.matches}`);
         console.log(`  mismatches: ${stats.mismatches}`);
+        if (stats.counterfactual) {
+          console.log(`  counterfactual_reviews: ${stats.counterfactual.total_reviews}`);
+          console.log(`  divergent_alternates: ${stats.counterfactual.divergent_alternates}`);
+          console.log(`  resolved_counterfactuals: ${stats.counterfactual.resolved_reviews}`);
+          console.log(`  divergent_losses_to_review: ${stats.counterfactual.divergent_resolved_losses}`);
+          if (stats.counterfactual.recent_reviews.length > 0) {
+            console.log("\n  Recent counterfactuals:");
+            for (const review of stats.counterfactual.recent_reviews.slice(0, 5)) {
+              const alternateSummary = review.alternates
+                .map((row) => `${row.regime}:${row.selected_pool || "none"}${row.diverged_from_active ? "*" : ""}`)
+                .join(", ");
+              const realized = review.realized_outcome
+                ? ` | realized=${review.realized_outcome.pnl_pct ?? "n/a"}% (${review.realized_outcome.usefulness_hint})`
+                : "";
+              console.log(`    - ${review.cycle_id}: active=${review.active_regime}:${review.active_selected_pool || "none"} | alternates=${alternateSummary}${realized}`);
+            }
+          }
+        }
         if (stats.recent_cycles.length > 0) {
           console.log("\n  Recent cycles:");
           for (const row of stats.recent_cycles) {

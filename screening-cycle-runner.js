@@ -5,6 +5,7 @@ export function createScreeningCycleRunner(deps) {
       config,
       getMyPositions,
       getWalletBalances,
+      discoverPools,
       getTopCandidates,
       classifyRuntimeFailure,
       validateStartupSnapshot,
@@ -23,6 +24,17 @@ export function createScreeningCycleRunner(deps) {
       roundMetric,
       agentLoop,
       evaluatePortfolioGuard,
+      getPerformanceSummary,
+      classifyRuntimeRegime,
+      applyRegimeHysteresis,
+      resolveRegimePackContext,
+      listCounterfactualRegimes,
+      getRegimePack,
+      getPerformanceSizingMultiplier,
+      getRiskSizingMultiplier,
+      getNegativeRegimeCooldown,
+      getNegativeRegimeMemory,
+      appendCounterfactualReview,
       recordCycleEvaluation,
       refreshRuntimeHealth,
       telegramEnabled,
@@ -142,13 +154,112 @@ export function createScreeningCycleRunner(deps) {
       log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
 
       const currentBalance = preBalance;
-      const deployAmount = computeDeployAmount(currentBalance.sol);
+      const performanceSummary = getPerformanceSummary?.() || null;
+      const discoverySnapshot = await discoverPools({
+        page_size: 50,
+        screeningConfig: config.screening,
+      }).catch((error) => ({ pools: [], error: error.message }));
+      const rawRegimeClassification = classifyRuntimeRegime({
+        walletSol: currentBalance.sol,
+        positionsCount: prePositions.total_positions,
+        maxPositions: config.risk.maxPositions,
+        deployFloor: config.management.deployAmountSol,
+        gasReserve: config.management.gasReserve,
+        performanceSummary,
+        marketPools: discoverySnapshot?.pools || [],
+      });
+      const regimeClassification = applyRegimeHysteresis({
+        classification: rawRegimeClassification,
+      });
+      const regimeContext = resolveRegimePackContext({
+        baseScreeningConfig: config.screening,
+        classification: regimeClassification,
+      });
+      const performanceMultiplier = getPerformanceSizingMultiplier(performanceSummary);
+      const riskMultiplier = getRiskSizingMultiplier({
+        positionsCount: prePositions.total_positions,
+        maxPositions: config.risk.maxPositions,
+      });
+      const deployAmount = computeDeployAmount(currentBalance.sol, {
+        regimeMultiplier: regimeContext.pack.deploy.regime_multiplier,
+        performanceMultiplier,
+        riskMultiplier,
+        skipBelowFloor: true,
+      });
       const activeStrategy = getActiveStrategy();
+      const strategyKey = activeStrategy?.lp_strategy || "bid_ask";
+
+      if (deployAmount <= 0) {
+        log("cron", "Screening skipped - adaptive sizing returned 0 deploy amount");
+        screeningEvaluation = {
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "skipped_sizing_floor",
+          summary: {
+            regime: regimeContext.regime,
+            reason_code: "adaptive_sizing_floor",
+            wallet_sol: roundMetric(currentBalance.sol),
+            reserve_sol: roundMetric(config.management.gasReserve),
+            deploy_floor_sol: roundMetric(config.management.deployAmountSol),
+          },
+          candidates: [],
+        };
+        return;
+      }
+
       const strategyBlock = activeStrategy
         ? `ACTIVE STRATEGY: ${activeStrategy.name} - LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED - never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
         : "No active strategy - use default bid_ask, bins_above: 0, SOL only.";
 
-      screeningTopCandidates = await getTopCandidates({ limit: 8 }).catch((error) => ({ error: error.message }));
+      const buildCooldownPolicy = (regimeLabel) => (pool) => {
+        const cooldown = getNegativeRegimeCooldown({
+          pool_address: pool.pool,
+          regime_label: regimeLabel,
+          strategy: strategyKey,
+        });
+        if (!cooldown.active) return null;
+        return {
+          blocked: true,
+          reason: "negative_regime_cooldown",
+          penalty_score: 100,
+          details: {
+            key: cooldown.key,
+            cooldown_until: cooldown.cooldown_until,
+            remaining_ms: cooldown.remaining_ms,
+            hits: cooldown.hits,
+          },
+        };
+      };
+
+      screeningTopCandidates = await getTopCandidates({
+        limit: 8,
+        pools: discoverySnapshot?.pools,
+        screeningConfig: regimeContext.effectiveScreeningConfig,
+        evaluationContext: {
+          extraHardBlockFn: (pool) => {
+            const globalCooldown = getNegativeRegimeMemory({
+              regime_label: regimeContext.regime,
+              strategy: strategyKey,
+            });
+            if (globalCooldown.active) {
+              return {
+                blocked: true,
+                reason: "negative_regime_memory_cooldown",
+                penalty_score: 100,
+                details: {
+                  key: globalCooldown.key,
+                  cooldown_until: globalCooldown.cooldown_until,
+                  remaining_ms: globalCooldown.remaining_ms,
+                  hits: globalCooldown.hits,
+                  sample_quality: globalCooldown.sample_quality,
+                  cumulative_negative_pnl_abs: globalCooldown.cumulative_negative_pnl_abs,
+                },
+              };
+            }
+            return buildCooldownPolicy(regimeContext.regime)(pool);
+          },
+        },
+      }).catch((error) => ({ error: error.message }));
       const screeningFailure = validateStartupSnapshot({
         wallet: { sol: preBalance.sol },
         positions: prePositions,
@@ -278,9 +389,77 @@ export function createScreeningCycleRunner(deps) {
 
       const candidateContext = buildCandidateContext({ shortlist, finalists, inspectionRows: finalistBlocks });
 
+      try {
+        const activeTop = shortlist[0] || null;
+        const alternates = [];
+        for (const altRegime of listCounterfactualRegimes(regimeContext.regime)) {
+          const altPack = getRegimePack(altRegime);
+          const altDeployAmount = computeDeployAmount(currentBalance.sol, {
+            regimeMultiplier: altPack.deploy.regime_multiplier,
+            performanceMultiplier,
+            riskMultiplier,
+            skipBelowFloor: true,
+          });
+          const altCandidates = await getTopCandidates({
+            limit: 3,
+            pools: discoverySnapshot?.pools,
+            screeningConfig: {
+              ...config.screening,
+              ...altPack.screening_overrides,
+            },
+            evaluationContext: {
+              extraHardBlockFn: (pool) => {
+                const globalCooldown = getNegativeRegimeMemory({
+                  regime_label: altRegime,
+                  strategy: strategyKey,
+                });
+                if (globalCooldown.active) {
+                  return {
+                    blocked: true,
+                    reason: "negative_regime_memory_cooldown",
+                    penalty_score: 100,
+                    details: {
+                      key: globalCooldown.key,
+                      cooldown_until: globalCooldown.cooldown_until,
+                      remaining_ms: globalCooldown.remaining_ms,
+                      hits: globalCooldown.hits,
+                      sample_quality: globalCooldown.sample_quality,
+                      cumulative_negative_pnl_abs: globalCooldown.cumulative_negative_pnl_abs,
+                    },
+                  };
+                }
+                return buildCooldownPolicy(altRegime)(pool);
+              },
+            },
+          }).catch(() => ({ candidates: [] }));
+          const altTop = (altCandidates?.candidates || [])[0] || null;
+          alternates.push({
+            regime: altRegime,
+            deploy_amount_sol: altDeployAmount,
+            selected_pool: altTop?.pool || null,
+            selected_score: altTop?.deterministic_score ?? null,
+            diverged_from_active: Boolean(activeTop && altTop && activeTop.pool !== altTop.pool),
+          });
+        }
+
+        appendCounterfactualReview({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          active_regime: regimeContext.regime,
+          active_reason: regimeContext.reason,
+          active_deploy_amount_sol: deployAmount,
+          active_selected_pool: activeTop?.pool || null,
+          active_selected_score: activeTop?.deterministic_score ?? null,
+          alternates,
+        });
+      } catch (counterfactualError) {
+        log("screening", `Counterfactual review skipped: ${counterfactualError.message}`);
+      }
+
       const { content } = await agentLoop(`
 SCREENING CYCLE - DEPLOY ONLY
 ${strategyBlock}
+Regime: ${regimeContext.regime} (${regimeContext.reason}) | Sizing multipliers: regime=${regimeContext.pack.deploy.regime_multiplier} perf=${performanceMultiplier} risk=${riskMultiplier}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 ${candidateContext}
 DECISION RULES (apply to the pre-loaded candidates above, no re-fetching needed):
@@ -303,12 +482,20 @@ STEPS:
         summary: {
           total_screened: screeningTopCandidates?.total_screened ?? candidates.length,
           total_eligible: totalEligible,
-          candidates_scored: candidateEvaluations.length,
-          candidates_blocked: candidateEvaluations.filter((candidate) => candidate.hard_blocked).length,
-          deploy_amount: deployAmount,
-          score_preload_limit: scorePreloadLimit,
-          blocked_summary: blockedSummary,
-        },
+            candidates_scored: candidateEvaluations.length,
+            candidates_blocked: candidateEvaluations.filter((candidate) => candidate.hard_blocked).length,
+            deploy_amount: deployAmount,
+            regime: regimeContext.regime,
+            regime_reason: regimeContext.reason,
+            regime_confidence: regimeContext.confidence,
+            regime_hysteresis_reason: regimeClassification.hysteresis_reason,
+            proposed_regime: regimeClassification.proposed_regime,
+            regime_multiplier: regimeContext.pack.deploy.regime_multiplier,
+            performance_multiplier: performanceMultiplier,
+            risk_multiplier: riskMultiplier,
+            score_preload_limit: scorePreloadLimit,
+            blocked_summary: blockedSummary,
+          },
         candidates: candidateEvaluations,
       };
     } catch (error) {

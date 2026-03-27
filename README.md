@@ -61,6 +61,11 @@ A third health check runs hourly to summarize portfolio state.
 - General free-form chat is now read-only by default; write-capable GENERAL tool access must be explicitly armed for a bounded window, while deterministic screening/management flows keep their existing runtime-owned privileges
 - Zenith now writes a machine-readable heartbeat to `data/runtime-health.json`, tracking startup status, cycle status, suppression state, provider health, and write-arming state for external checks
 - Setup writes `WALLET_PRIVATE_KEY` to `.env` and Zenith reads wallet secrets from environment only
+- Screening now applies fixed regime-conditioned parameter packs (`defensive` / `neutral` / `offensive`) deterministically, without mutating global config or letting the model invent new policy
+- Regime switching now uses bounded hysteresis with confirmation, active dwell time, and stale-pending decay so Zenith does not flap between packs on marginal inputs
+- Threshold evolution is now rollout-based with automatic accept/rollback, so a bad auto-tune can revert instead of ratcheting forever
+- Deploy sizing now adapts under hard caps using regime, recent realized performance, and position-utilization context, while still respecting reserve/floor/ceiling rules
+- Negative memory now includes cross-pool regime cooldowns with sample-quality gating, and screening also records observational counterfactual review for alternate regime packs without executing them
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -269,6 +274,12 @@ Strategy memory no longer depends only on exact `strategy + bin step` pairings. 
 
 `/learn` still supports deeper top-LPer study for qualitative lessons, while `/evolve` updates screening thresholds from closed-position history. Those lessons and evolved thresholds are fed back into future cycles without requiring a restart.
 
+Threshold evolution is now bounded as a rollout instead of a blind overwrite:
+
+- Zenith stores the previous and new threshold values in `threshold-rollout.json`
+- after the minimum number of subsequent closes, Zenith either accepts the rollout or rolls it back automatically if post-change performance degrades
+- this keeps evolution online and autonomous without letting one bad step permanently distort screening
+
 Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, and compact counters such as candidates scored, candidates blocked, runtime actions handled, and write-tool blocks/errors. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
 
 Management runtime actions also expose explicit subreason codes (for example stop loss, take profit, low fee yield, fee threshold, or out-of-range rebalance) so operator-facing reports and tests can describe *why* runtime acted without widening prompt-owned policy.
@@ -314,6 +325,15 @@ Zenith now adds a thin elite-ops layer on top of runtime hardening:
 - `operator-controls.js` — bounded GENERAL write arming plus durable, restart-aware operator resume actions
 - `management-cycle-runner.js` / `screening-cycle-runner.js` — extracted autonomous cycle runners so `index.js` stays focused on boot and wiring
 - `interactive-interface.js` / `startup-interface.js` — extracted REPL, Telegram, and startup surfaces so operator flow is no longer embedded directly in `index.js`
+
+### Phase 6 bounded adaptation surfaces
+
+Zenith now adds a constrained adaptation layer rather than open-ended self-training:
+
+- `regime-packs.js` — fixed regime classification and parameter-pack overlays for screening and sizing
+- `negative-regime-memory.js` — cross-pool cooldown memory for repeatedly bad regime/strategy combinations
+- `counterfactual-review.js` — observational-only records of what alternate regime packs would have selected, later linked to realized active outcomes for review usefulness
+- `lessons.js` rollout state — threshold evolution with persisted accept/rollback metadata instead of one-way mutation
 
 Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
 
@@ -378,6 +398,9 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `replay-review.test.js` — replay lookup and reconciliation review helpers
 - `operator-controls.test.js` — GENERAL write arming and operator audit logging
 - `agent-tools.test.js` — read-only GENERAL tool surface by default
+- `regime-packs.test.js` — deterministic regime classification and pack application
+- `negative-regime-memory.test.js` — cross-pool negative regime cooldown persistence
+- `counterfactual-review.test.js` — observational counterfactual review persistence
 
 Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 

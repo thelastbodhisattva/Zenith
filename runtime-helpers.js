@@ -47,3 +47,51 @@ export function estimateInitialValueUsd({ amountSol = 0, solPrice = 0, amountTok
   }
   return 0;
 }
+
+export function computeAdaptiveDeployAmount({
+  walletSol = 0,
+  reserve = 0,
+  floor = 0,
+  ceil = Number.POSITIVE_INFINITY,
+  positionSizePct = 0,
+  regimeMultiplier = 1,
+  performanceMultiplier = 1,
+  riskMultiplier = 1,
+  skipBelowFloor = true,
+} = {}) {
+  const normalizedWalletSol = Number(walletSol);
+  const normalizedReserve = Number(reserve);
+  const normalizedFloor = Number(floor);
+  const normalizedCeil = Number(ceil);
+  const normalizedPct = Number(positionSizePct);
+  const normalizedRegimeMultiplier = Number(regimeMultiplier);
+  const normalizedPerformanceMultiplier = Number(performanceMultiplier);
+  const normalizedRiskMultiplier = Number(riskMultiplier);
+
+  if (!Number.isFinite(normalizedWalletSol) || normalizedWalletSol <= 0) return 0;
+  if (!Number.isFinite(normalizedReserve) || normalizedReserve < 0) return 0;
+  if (!Number.isFinite(normalizedFloor) || normalizedFloor < 0) return 0;
+  if (!Number.isFinite(normalizedCeil) || normalizedCeil <= 0) return 0;
+  if (!Number.isFinite(normalizedPct) || normalizedPct <= 0) return 0;
+  if (!Number.isFinite(normalizedRegimeMultiplier) || normalizedRegimeMultiplier <= 0) return 0;
+  if (!Number.isFinite(normalizedPerformanceMultiplier) || normalizedPerformanceMultiplier <= 0) return 0;
+  if (!Number.isFinite(normalizedRiskMultiplier) || normalizedRiskMultiplier <= 0) return 0;
+
+  const deployable = Math.max(0, normalizedWalletSol - normalizedReserve);
+  if (deployable <= 0) return 0;
+
+  const scaled = deployable
+    * normalizedPct
+    * normalizedRegimeMultiplier
+    * normalizedPerformanceMultiplier
+    * normalizedRiskMultiplier;
+
+  const cappedScaled = Math.min(deployable, normalizedCeil, Math.max(0, scaled));
+  if (skipBelowFloor && deployable < normalizedFloor) return 0;
+
+  const floored = Math.max(normalizedFloor, cappedScaled);
+  const result = Math.min(deployable, normalizedCeil, floored);
+
+  if (!Number.isFinite(result) || result <= 0) return 0;
+  return Number(result.toFixed(2));
+}

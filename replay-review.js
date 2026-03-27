@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { getCounterfactualReviewSummary } from "./counterfactual-review.js";
 import { getReplayEnvelope as getStoredReplayEnvelope, readReplayEnvelopes } from "./cycle-trace.js";
 import { reconcileManagementEnvelope, reconcileScreeningEnvelope } from "./reconciliation.js";
 
@@ -61,6 +62,7 @@ export function getReplayReviewStats(limit = 25) {
 
   return {
     ...stats,
+    counterfactual: getCounterfactualReviewSummary(Math.min(limit, 10)),
     recent_cycles: recent.slice(-10).reverse().map((envelope) => ({
       cycle_id: envelope.cycle_id,
       cycle_type: envelope.cycle_type,

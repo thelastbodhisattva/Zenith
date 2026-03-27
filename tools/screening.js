@@ -7,8 +7,8 @@ const DISCOVERY_CACHE_TTL_MS = 15 * 1000;
 
 const discoveryCache = new Map();
 
-function getDiscoveryCacheKey({ page_size, timeframe, category }) {
-  return JSON.stringify({ page_size, timeframe, category });
+function getDiscoveryCacheKey({ page_size, timeframe, category, screeningFingerprint }) {
+  return JSON.stringify({ page_size, timeframe, category, screeningFingerprint });
 }
 
 export function resetDiscoveryCache() {
@@ -23,17 +23,37 @@ export function resetDiscoveryCache() {
  */
 export async function discoverPools({
   page_size = 50,
-  timeframe = config.screening.timeframe,
-  category = config.screening.category,
+  timeframe,
+  category,
+  screeningConfig,
   force = false,
 } = {}) {
-  const cacheKey = getDiscoveryCacheKey({ page_size, timeframe, category });
+  const s = screeningConfig || config.screening;
+  const resolvedTimeframe = timeframe ?? s.timeframe;
+  const resolvedCategory = category ?? s.category;
+  const screeningFingerprint = [
+    s.minMcap,
+    s.maxMcap,
+    s.minHolders,
+    s.minVolume,
+    s.minTvl,
+    s.maxTvl,
+    s.minBinStep,
+    s.maxBinStep,
+    s.minFeeActiveTvlRatio,
+    s.minOrganic,
+  ].join("|");
+  const cacheKey = getDiscoveryCacheKey({
+    page_size,
+    timeframe: resolvedTimeframe,
+    category: resolvedCategory,
+    screeningFingerprint,
+  });
   const cached = discoveryCache.get(cacheKey);
   if (!force && cached && Date.now() - cached.cachedAt < DISCOVERY_CACHE_TTL_MS) {
     return cached.value;
   }
 
-  const s = config.screening;
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -55,8 +75,8 @@ export async function discoverPools({
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
-    `&timeframe=${timeframe}` +
-    `&category=${category}`;
+    `&timeframe=${resolvedTimeframe}` +
+    `&category=${resolvedCategory}`;
 
   const res = await fetch(url);
 
@@ -101,11 +121,16 @@ export async function discoverPools({
  */
 export async function getTopCandidates({
   limit = 10,
+  pools,
   discoverPoolsFn,
   getMyPositionsFn,
+  screeningConfig,
+  evaluationContext,
 } = {}) {
   const discover = discoverPoolsFn || discoverPools;
-  const { pools } = await discover({ page_size: 50 });
+  const resolvedPools = Array.isArray(pools)
+    ? pools
+    : (await discover({ page_size: 50, screeningConfig })).pools;
 
   // Exclude pools where the wallet already has an open position
   const readPositions = getMyPositionsFn || (await import("./dlmm.js")).getMyPositions;
@@ -123,15 +148,17 @@ export async function getTopCandidates({
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const { candidates, blocked_summary, total_eligible } = rankCandidateSnapshots(pools, {
+  const { candidates, blocked_summary, total_eligible } = rankCandidateSnapshots(resolvedPools, {
     occupiedPools,
     occupiedMints,
     limit,
+    screeningConfig,
+    evaluationContext,
   });
 
   return {
     candidates,
-    total_screened: pools.length,
+    total_screened: resolvedPools.length,
     total_eligible,
     blocked_summary,
   };
@@ -141,8 +168,15 @@ export function rankCandidateSnapshots(pools, {
   occupiedPools = new Set(),
   occupiedMints = new Set(),
   limit = 10,
+  screeningConfig,
+  evaluationContext,
 } = {}) {
-  const evaluations = pools.map((pool) => evaluateCandidateSnapshot(pool, { occupiedPools, occupiedMints }));
+  const evaluations = pools.map((pool) => evaluateCandidateSnapshot(pool, {
+    occupiedPools,
+    occupiedMints,
+    screeningConfig,
+    evaluationContext,
+  }));
   const blocked_summary = summarizeBlockedCandidates(evaluations);
   const candidates = evaluations
     .filter((pool) => pool.eligible)
@@ -164,11 +198,14 @@ export function rankCandidateSnapshots(pools, {
 export function evaluateCandidateSnapshot(pool, {
   occupiedPools = new Set(),
   occupiedMints = new Set(),
+  screeningConfig,
+  evaluationContext,
 } = {}) {
+  const s = screeningConfig || config.screening;
   const hard_blocks = [];
   const token_age_hours = asTokenAgeHours(pool.token_age_hours);
-  const minTokenAgeHours = asOptionalTokenAgeThreshold(config.screening.minTokenAgeHours);
-  const maxTokenAgeHours = asOptionalTokenAgeThreshold(config.screening.maxTokenAgeHours);
+  const minTokenAgeHours = asOptionalTokenAgeThreshold(s.minTokenAgeHours);
+  const maxTokenAgeHours = asOptionalTokenAgeThreshold(s.maxTokenAgeHours);
   const tokenTooNew = token_age_hours != null && minTokenAgeHours != null && token_age_hours < minTokenAgeHours;
   const tokenTooOld = token_age_hours != null && maxTokenAgeHours != null && token_age_hours > maxTokenAgeHours;
   const gate_results = {
@@ -186,8 +223,16 @@ export function evaluateCandidateSnapshot(pool, {
   if (tokenTooNew) hard_blocks.push("token_too_new");
   if (tokenTooOld) hard_blocks.push("token_too_old");
 
-  const score_breakdown = buildCandidateScore(pool);
-  const deterministic_score = score_breakdown.total_score;
+  const extraPolicy = typeof evaluationContext?.extraHardBlockFn === "function"
+    ? evaluationContext.extraHardBlockFn(pool)
+    : null;
+  if (extraPolicy?.blocked && extraPolicy.reason) {
+    hard_blocks.push(extraPolicy.reason);
+  }
+
+  const score_breakdown = buildCandidateScore(pool, s);
+  const penalty = Number(extraPolicy?.penalty_score || 0);
+  const deterministic_score = round2(Math.max(0, score_breakdown.total_score - Math.max(0, penalty)));
 
   return {
     ...pool,
@@ -198,6 +243,7 @@ export function evaluateCandidateSnapshot(pool, {
     gate_results,
     deterministic_score,
     score_breakdown,
+    extra_policy: extraPolicy || null,
   };
 }
 
@@ -289,11 +335,11 @@ function condensePool(p) {
   };
 }
 
-function buildCandidateScore(pool) {
-  const feeEfficiency = normalizeFloor(pool.fee_active_tvl_ratio, config.screening.minFeeActiveTvlRatio, 4);
-  const volume = normalizeFloor(pool.volume_window, config.screening.minVolume, 20);
-  const organic = normalizeRange(pool.organic_score, config.screening.minOrganic, 100);
-  const holderDepth = normalizeFloor(pool.holders, config.screening.minHolders, 4);
+function buildCandidateScore(pool, screeningConfig) {
+  const feeEfficiency = normalizeFloor(pool.fee_active_tvl_ratio, screeningConfig.minFeeActiveTvlRatio, 4);
+  const volume = normalizeFloor(pool.volume_window, screeningConfig.minVolume, 20);
+  const organic = normalizeRange(pool.organic_score, screeningConfig.minOrganic, 100);
+  const holderDepth = normalizeFloor(pool.holders, screeningConfig.minHolders, 4);
   const activeLiquidity = clamp01((pool.active_pct ?? 0) / 100);
   const volatilityFit = scoreVolatility(pool.volatility);
 

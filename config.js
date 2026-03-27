@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getEffectiveMinSolToOpen, normalizeOptionalNonNegativeNumber } from "./runtime-helpers.js";
+import { computeAdaptiveDeployAmount, getEffectiveMinSolToOpen, normalizeOptionalNonNegativeNumber } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
@@ -126,15 +126,31 @@ export const config = {
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
-export function computeDeployAmount(walletSol) {
+export function computeDeployAmount(walletSol, {
+  regimeMultiplier = 1,
+  performanceMultiplier = 1,
+  riskMultiplier = 1,
+  skipBelowFloor = true,
+  floorOverride,
+  reserveOverride,
+  positionSizePctOverride,
+  maxDeployOverride,
+} = {}) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
   const floor    = config.management.deployAmountSol;
   const ceil     = config.risk.maxDeployAmount;
-  const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+  return computeAdaptiveDeployAmount({
+    walletSol,
+    reserve: reserveOverride ?? reserve,
+    floor: floorOverride ?? floor,
+    ceil: maxDeployOverride ?? ceil,
+    positionSizePct: positionSizePctOverride ?? pct,
+    regimeMultiplier,
+    performanceMultiplier,
+    riskMultiplier,
+    skipBelowFloor,
+  });
 }
 
 /**

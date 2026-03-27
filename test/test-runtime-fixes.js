@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { estimateInitialValueUsd, getEffectiveMinSolToOpen, getRequiredSolBalance, getScreeningThresholdSummary } from "../runtime-helpers.js";
+import {
+  computeAdaptiveDeployAmount,
+  estimateInitialValueUsd,
+  getEffectiveMinSolToOpen,
+  getRequiredSolBalance,
+  getScreeningThresholdSummary,
+} from "../runtime-helpers.js";
 
 test("effective min SOL always covers deploy amount plus gas reserve", () => {
   assert.equal(getRequiredSolBalance({ deployAmountSol: 0.5, gasReserve: 0.2 }), 0.7);
@@ -47,4 +53,40 @@ test("initial deploy value estimate prefers SOL leg and falls back to token leg"
   assert.equal(estimateInitialValueUsd({ amountSol: 0.5, solPrice: 120 }), 60);
   assert.equal(estimateInitialValueUsd({ amountSol: 0, amountToken: 1200, activePrice: 600, solPrice: 100 }), 200);
   assert.equal(estimateInitialValueUsd({ amountSol: 0, amountToken: 1200, activePrice: 0, solPrice: 100 }), 0);
+});
+
+test("adaptive deploy sizing preserves reserve/floor/cap invariants", () => {
+  const sized = computeAdaptiveDeployAmount({
+    walletSol: 3,
+    reserve: 0.2,
+    floor: 0.5,
+    ceil: 1.5,
+    positionSizePct: 0.35,
+    regimeMultiplier: 1.2,
+    performanceMultiplier: 1,
+    riskMultiplier: 1,
+  });
+  assert.equal(sized, 1.18);
+
+  const capped = computeAdaptiveDeployAmount({
+    walletSol: 100,
+    reserve: 0.2,
+    floor: 0.5,
+    ceil: 2,
+    positionSizePct: 0.5,
+    regimeMultiplier: 1.2,
+    performanceMultiplier: 1.1,
+    riskMultiplier: 1,
+  });
+  assert.equal(capped, 2);
+
+  const skipped = computeAdaptiveDeployAmount({
+    walletSol: 0.62,
+    reserve: 0.2,
+    floor: 0.5,
+    ceil: 2,
+    positionSizePct: 0.35,
+    skipBelowFloor: true,
+  });
+  assert.equal(skipped, 0);
 });
