@@ -85,6 +85,14 @@ export function getRecoveryResumeOverrideStatus({ nowMs = Date.now() } = {}) {
   };
 }
 
+export function getOperatorControlSnapshot({ nowMs = Date.now(), recentActionLimit = 5 } = {}) {
+  return {
+    general_write_arm: getGeneralWriteArmStatus({ nowMs }),
+    recovery_resume_override: getRecoveryResumeOverrideStatus({ nowMs }),
+    recent_actions: listOperatorActions(recentActionLimit),
+  };
+}
+
 export function clearRecoveryResumeOverride({ reason = "operator clear", nowMs = Date.now() } = {}) {
   const state = loadState();
   const wasActive = Number(state.recovery_resume_override_until_ms || 0) > nowMs;

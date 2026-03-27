@@ -9,6 +9,7 @@ export async function handleOperatorCommandText({
   acknowledgeRecoveryResume,
   armGeneralWriteTools,
   disarmGeneralWriteTools,
+  getOperatorControlSnapshot,
   refreshRuntimeHealth,
 } = {}) {
   if (!text) return { handled: false, message: null };
@@ -18,19 +19,21 @@ export async function handleOperatorCommandText({
     const minutes = Math.max(1, Number(minutesRaw) || 10);
     const reason = reasonParts.join(" ") || `${source} operator arm`;
     const armStatus = armGeneralWriteTools({ minutes, reason });
+    const snapshot = getOperatorControlSnapshot?.() || { general_write_arm: armStatus };
     refreshRuntimeHealth();
     return {
       handled: true,
-      message: `GENERAL write tools armed for ${minutes} minute(s)${armStatus.armed_until ? ` until ${armStatus.armed_until}` : ""}.`,
+      message: `GENERAL write tools armed for ${minutes} minute(s)${snapshot.general_write_arm?.armed_until ? ` until ${snapshot.general_write_arm.armed_until}` : ""}.`,
     };
   }
 
   if (text.startsWith("/disarm")) {
-    disarmGeneralWriteTools({ reason: `${source} operator disarm` });
+    const armStatus = disarmGeneralWriteTools({ reason: `${source} operator disarm` });
+    const snapshot = getOperatorControlSnapshot?.() || { general_write_arm: armStatus };
     refreshRuntimeHealth();
     return {
       handled: true,
-      message: "GENERAL write tools disarmed.",
+      message: `GENERAL write tools ${snapshot.general_write_arm?.armed ? "still armed" : "disarmed"}.`,
     };
   }
 
@@ -53,10 +56,11 @@ export async function handleOperatorCommandText({
       source,
       override_minutes: config.protections.recoveryResumeOverrideMinutes,
     });
+    const snapshot = getOperatorControlSnapshot?.() || { recovery_resume_override: override };
     refreshRuntimeHealth();
     return {
       handled: true,
-      message: `Autonomous write suppression cleared. Previous suppression: ${suppression.reason || "none"}. Guard pause cleared: ${clearedGuard.cleared ? "yes" : "no"}. Persisted resume override until ${override.override_until || "n/a"}.`,
+      message: `Autonomous write suppression cleared. Previous suppression: ${suppression.reason || "none"}. Guard pause cleared: ${clearedGuard.cleared ? "yes" : "no"}. Persisted resume override until ${snapshot.recovery_resume_override?.override_until || "n/a"}.`,
     };
   }
 

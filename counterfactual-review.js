@@ -52,19 +52,33 @@ export function attachCounterfactualRealizedOutcome({
   pnl_usd = null,
   close_reason = null,
   closed_at = new Date().toISOString(),
+  decision_cycle_id = null,
+  decision_action_id = null,
+  decision_workflow_id = null,
 } = {}) {
   if (!pool_address) return { updated: false, reason: "pool_address_required" };
 
   const reviews = readReviews();
-  const matchIndex = [...reviews]
-    .reverse()
-    .findIndex((review) => review.active_selected_pool === pool_address && !review.realized_outcome && (!regime_label || !review.active_regime || review.active_regime === regime_label));
+  let actualIndex = -1;
 
-  if (matchIndex === -1) {
+  if (decision_cycle_id) {
+    actualIndex = reviews.findIndex((review) => review.cycle_id === decision_cycle_id && !review.realized_outcome);
+  }
+
+  if (actualIndex === -1) {
+    const matchIndex = [...reviews]
+      .reverse()
+      .findIndex((review) => review.active_selected_pool === pool_address && !review.realized_outcome && (!regime_label || !review.active_regime || review.active_regime === regime_label));
+
+    if (matchIndex !== -1) {
+      actualIndex = reviews.length - 1 - matchIndex;
+    }
+  }
+
+  if (actualIndex === -1) {
     return { updated: false, reason: "no_matching_counterfactual_review" };
   }
 
-  const actualIndex = reviews.length - 1 - matchIndex;
   const review = reviews[actualIndex];
   const divergentCount = (review.alternates || []).filter((row) => row.diverged_from_active).length;
   review.realized_outcome = {
@@ -72,6 +86,9 @@ export function attachCounterfactualRealizedOutcome({
     pnl_usd: Number.isFinite(Number(pnl_usd)) ? Number(pnl_usd) : null,
     close_reason,
     closed_at,
+    decision_cycle_id,
+    decision_action_id,
+    decision_workflow_id,
     usefulness_hint: divergentCount > 0 && Number(pnl_pct) < 0
       ? "review_divergent_alternates"
       : divergentCount > 0

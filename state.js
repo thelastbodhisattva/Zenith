@@ -11,6 +11,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { foldActionJournal, readActionJournal } from "./action-journal.js";
+import { evaluateTrackedPositionExit } from "./runtime-policy.js";
 
 const STATE_FILE = "./state.json";
 
@@ -123,6 +124,10 @@ export function trackPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  opened_by_cycle_id = null,
+  opened_by_action_id = null,
+  opened_by_workflow_id = null,
+  regime_label = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -133,8 +138,12 @@ export function trackPosition({
     strategy,
     bin_range,
     amount_sol,
-    amount_x,
-    active_bin_at_deploy: active_bin,
+      amount_x,
+      opened_by_cycle_id,
+      opened_by_action_id,
+      opened_by_workflow_id,
+      regime_label,
+      active_bin_at_deploy: active_bin,
     bin_step,
     volatility,
     fee_tvl_ratio,
@@ -355,49 +364,28 @@ export function setPositionInstruction(position_address, instruction) {
  * Returns an action string if a threshold is hit, or null.
  */
 export function updatePnlAndCheckExits(position_address, currentPnlPct, config, { stale = false } = {}) {
-  const normalizedPnlPct = Number(currentPnlPct);
-  if (stale || !Number.isFinite(normalizedPnlPct)) return null;
-
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
 
-  currentPnlPct = normalizedPnlPct;
+  const exitEvaluation = evaluateTrackedPositionExit({
+    positionState: pos,
+    currentPnlPct,
+    managementConfig: config.management,
+    stale,
+  });
 
-  const mgmt = config.management;
-  let action = null;
-
-  if (mgmt.stopLossPct != null && currentPnlPct <= mgmt.stopLossPct) {
-    action = `STOP_LOSS: PnL ${currentPnlPct.toFixed(1)}% hit stop loss (${mgmt.stopLossPct}%)`;
-    pos.notes.push(action);
-    save(state);
-    return action;
+  pos.peak_pnl_pct = exitEvaluation.peak_pnl_pct;
+  pos.trailing_active = exitEvaluation.trailing_active;
+  if (exitEvaluation.notes.length > 0) {
+    pos.notes.push(...exitEvaluation.notes);
   }
-
-  if (currentPnlPct > (pos.peak_pnl_pct || 0)) {
-    pos.peak_pnl_pct = currentPnlPct;
-  }
-
-  if (mgmt.trailingTakeProfit) {
-    if (!pos.trailing_active && currentPnlPct >= mgmt.trailingTriggerPct) {
-      pos.trailing_active = true;
-      pos.notes.push(`Trailing TP activated at ${currentPnlPct.toFixed(1)}%`);
-      log("state", `Position ${position_address} trailing TP activated (peak: ${currentPnlPct.toFixed(1)}%)`);
-    }
-
-    if (pos.trailing_active) {
-      const dropFromPeak = (pos.peak_pnl_pct || 0) - currentPnlPct;
-      if (dropFromPeak >= mgmt.trailingDropPct) {
-        action = `TRAILING_TP: PnL dropped ${dropFromPeak.toFixed(1)}% from peak ${(pos.peak_pnl_pct || 0).toFixed(1)}% (trail: ${mgmt.trailingDropPct}%)`;
-        pos.notes.push(action);
-        save(state);
-        return action;
-      }
-    }
+  if (exitEvaluation.log_message) {
+    log("state", `Position ${position_address} ${exitEvaluation.log_message}`);
   }
 
   save(state);
-  return action;
+  return exitEvaluation.action;
 }
 
 /**

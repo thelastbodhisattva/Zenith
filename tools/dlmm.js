@@ -21,6 +21,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { evaluatePortfolioGuard } from "../portfolio-guards.js";
+import { DEPLOY_GOVERNANCE_CODES, evaluateDeployAdmission } from "../runtime-policy.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import { getPoolDeployCooldown } from "../pool-memory.js";
 import { appendActionLifecycle } from "../action-journal.js";
@@ -512,31 +513,47 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  decision_context = null,
 }) {
   pool_address = normalizeMint(pool_address);
   const portfolioGuard = evaluatePortfolioGuard();
-  if (portfolioGuard.blocked) {
-    return {
-      success: false,
-      blocked: true,
-      reason: "portfolio_guard_pause_active",
-      pool: pool_address,
-      pause_until: portfolioGuard.pause_until,
-      guard_reason: portfolioGuard.reason,
-      guard_reason_code: portfolioGuard.reason_code,
-    };
-  }
   const cooldown = getPoolDeployCooldown({ pool_address });
-  if (cooldown.active) {
-    return {
-      success: false,
-      blocked: true,
-      reason: "pool_low_yield_cooldown_active",
-      pool: pool_address,
-      cooldown_until: cooldown.cooldown_until,
-      cooldown_reason: cooldown.reason,
-      remaining_minutes: Math.ceil((cooldown.remaining_ms || 0) / 60000),
-    };
+  const deployAdmission = evaluateDeployAdmission({
+    config,
+    poolAddress: pool_address,
+    amountY: amount_y ?? amount_sol ?? 0,
+    amountX: amount_x ?? 0,
+    portfolioGuard,
+    poolCooldown: cooldown,
+    enforcePositionLimit: false,
+    enforceExposure: false,
+    enforceBinStep: false,
+    enforceSize: false,
+    enforceBalance: false,
+  });
+  if (!deployAdmission.pass) {
+    if (deployAdmission.code === DEPLOY_GOVERNANCE_CODES.PORTFOLIO_GUARD_ACTIVE) {
+      return {
+        success: false,
+        blocked: true,
+        reason: "portfolio_guard_pause_active",
+        pool: pool_address,
+        pause_until: portfolioGuard.pause_until,
+        guard_reason: portfolioGuard.reason,
+        guard_reason_code: portfolioGuard.reason_code,
+      };
+    }
+    if (deployAdmission.code === DEPLOY_GOVERNANCE_CODES.POOL_LOW_YIELD_COOLDOWN_ACTIVE) {
+      return {
+        success: false,
+        blocked: true,
+        reason: "pool_low_yield_cooldown_active",
+        pool: pool_address,
+        cooldown_until: cooldown.cooldown_until,
+        cooldown_reason: cooldown.reason,
+        remaining_minutes: Math.ceil((cooldown.remaining_ms || 0) / 60000),
+      };
+    }
   }
 
   const activeStrategy = strategy || config.strategy.strategy;
@@ -689,6 +706,10 @@ export async function deployPosition({
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd: deployValueUsd,
+      opened_by_cycle_id: decision_context?.cycle_id || null,
+      opened_by_action_id: decision_context?.action_id || null,
+      opened_by_workflow_id: decision_context?.workflow_id || null,
+      regime_label: decision_context?.regime_label || null,
     });
 
     const actualBinStep = pool.lbPair.binStep;
@@ -1315,6 +1336,7 @@ export async function rebalanceOnExit({
   expected_volume_profile,
   execute = true,
   journal_workflow_id = null,
+  decision_context = null,
 } = {}) {
   const portfolioGuard = evaluatePortfolioGuard();
   if (portfolioGuard.blocked) {
@@ -1451,7 +1473,7 @@ export async function rebalanceOnExit({
     };
   }
 
-  const closeResult = await closePosition({ position_address });
+  const closeResult = await closePosition({ position_address, decision_context });
   if (!closeResult?.success) {
     return {
       success: false,
@@ -1543,6 +1565,7 @@ export async function rebalanceOnExit({
     ...actionPlan.deploy_position,
     amount_x: recoveredDeltaPlan.amount_x,
     amount_y: recoveredDeltaPlan.amount_y,
+    decision_context,
   };
   const deployResult = await deployPosition(deployArgs);
 
@@ -1852,7 +1875,7 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, reason = "agent decision" }) {
+export async function closePosition({ position_address, reason = "agent decision", decision_context = null }) {
   position_address = normalizeMint(position_address);
   const trackedPosition = getTrackedPosition(position_address);
   if (trackedPosition?.closed) {
@@ -1931,44 +1954,31 @@ export async function closePosition({ position_address, reason = "agent decision
       }
 
       // Snapshot PnL from cache BEFORE invalidating — this was the last known state before close
-      let pnlUsd = 0;
-      let pnlPct = 0;
-      let finalValueUsd = 0;
-      let feesUsd = tracked.total_fees_claimed_usd || 0;
-      const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
-      if (cachedPos) {
-        pnlUsd        = cachedPos.pnl_usd   ?? 0;
-        pnlPct        = cachedPos.pnl_pct   ?? 0;
-        finalValueUsd = cachedPos.total_value_usd ?? 0;
-        feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
-      }
-
+      const closePerformance = buildClosePerformancePayload({
+        tracked,
+        cachedPosition: _positionsCache?.positions?.find((position) => position.position === position_address),
+        poolAddress,
+        pool,
+        positionAddress: position_address,
+        minutesHeld,
+        minutesOutOfRange: minutesOOR,
+        reason,
+        decisionContext: decision_context,
+      });
       _positionsCacheAt = 0; // invalidate cache after snapshotting PnL
-      const initialUsd = tracked.initial_value_usd || 0;
+      await recordPerformance(closePerformance.performance);
 
-      await recordPerformance({
+      return {
+        success: true,
         position: position_address,
         pool: poolAddress,
-        pool_name: tracked.pool_name || poolAddress.slice(0, 8),
-        strategy: tracked.strategy,
-        bin_range: tracked.bin_range,
-        bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility || null,
-        fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-        organic_score: tracked.organic_score || null,
-        amount_sol: tracked.amount_sol,
-        base_mint: tracked.base_mint || pool.lbPair.tokenXMint.toString(),
-        fees_earned_usd: feesUsd,
-        final_value_usd: finalValueUsd,
-        initial_value_usd: initialUsd,
-        minutes_in_range: minutesHeld - minutesOOR,
-        minutes_held: minutesHeld,
-        claim_count: tracked.claim_count || 0,
-        rebalance_count: tracked.rebalance_count || 0,
+        pool_name: tracked.pool_name || null,
+        txs: txHashes,
+        pnl_usd: closePerformance.result.pnl_usd,
+        pnl_pct: closePerformance.result.pnl_pct,
+        base_mint: pool.lbPair.tokenXMint.toString(),
         close_reason: reason,
-      });
-
-      return { success: true, position: position_address, pool: poolAddress, pool_name: tracked.pool_name || null, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct, base_mint: pool.lbPair.tokenXMint.toString(), close_reason: reason };
+      };
     }
 
     return { success: true, position: position_address, pool: poolAddress, pool_name: null, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString(), close_reason: reason };
@@ -1976,6 +1986,60 @@ export async function closePosition({ position_address, reason = "agent decision
     log("close_error", error.message);
     return { success: false, error: error.message };
   }
+}
+
+function buildClosePerformancePayload({
+  tracked,
+  cachedPosition,
+  poolAddress,
+  pool,
+  positionAddress,
+  minutesHeld,
+  minutesOutOfRange,
+  reason,
+  decisionContext,
+} = {}) {
+  const pnlUsd = cachedPosition?.pnl_usd ?? 0;
+  const pnlPct = cachedPosition?.pnl_pct ?? 0;
+  const finalValueUsd = cachedPosition?.total_value_usd ?? 0;
+  const feesUsd = cachedPosition
+    ? (cachedPosition.collected_fees_usd || 0) + (cachedPosition.unclaimed_fees_usd || 0)
+    : tracked.total_fees_claimed_usd || 0;
+
+  return {
+    performance: {
+      position: positionAddress,
+      pool: poolAddress,
+      pool_name: tracked.pool_name || poolAddress.slice(0, 8),
+      strategy: tracked.strategy,
+      bin_range: tracked.bin_range,
+      bin_step: tracked.bin_step || null,
+      volatility: tracked.volatility || null,
+      fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+      organic_score: tracked.organic_score || null,
+      amount_sol: tracked.amount_sol,
+      base_mint: tracked.base_mint || pool.lbPair.tokenXMint.toString(),
+      fees_earned_usd: feesUsd,
+      final_value_usd: finalValueUsd,
+      initial_value_usd: tracked.initial_value_usd || 0,
+      minutes_in_range: Math.max(0, (minutesHeld || 0) - (minutesOutOfRange || 0)),
+      minutes_held: minutesHeld || 0,
+      claim_count: tracked.claim_count || 0,
+      rebalance_count: tracked.rebalance_count || 0,
+      close_reason: reason,
+      regime_label: tracked.regime_label || null,
+      opened_by_cycle_id: tracked.opened_by_cycle_id || null,
+      opened_by_action_id: tracked.opened_by_action_id || null,
+      opened_by_workflow_id: tracked.opened_by_workflow_id || null,
+      closed_by_cycle_id: decisionContext?.cycle_id || null,
+      closed_by_action_id: decisionContext?.action_id || null,
+      closed_by_workflow_id: decisionContext?.workflow_id || null,
+    },
+    result: {
+      pnl_usd: pnlUsd,
+      pnl_pct: pnlPct,
+    },
+  };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────

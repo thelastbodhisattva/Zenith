@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
+import { evaluateExposureAdmission } from "../runtime-policy.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const DISCOVERY_CACHE_TTL_MS = 15 * 1000;
@@ -161,6 +162,9 @@ export async function getTopCandidates({
     total_screened: resolvedPools.length,
     total_eligible,
     blocked_summary,
+    occupied_pools: Array.from(occupiedPools),
+    occupied_mints: Array.from(occupiedMints),
+    candidate_inputs: resolvedPools,
   };
 }
 
@@ -217,8 +221,13 @@ export function evaluateCandidateSnapshot(pool, {
     token_age_max_ok: maxTokenAgeHours == null || token_age_hours == null || token_age_hours <= maxTokenAgeHours,
   };
 
-  if (!gate_results.pool_unoccupied) hard_blocks.push("pool_already_open");
-  if (!gate_results.token_unoccupied) hard_blocks.push("base_token_already_held");
+  const exposure = evaluateExposureAdmission({
+    poolAddress: pool.pool,
+    baseMint: pool.base?.mint,
+    occupiedPools,
+    occupiedMints,
+  });
+  if (!exposure.pass && Array.isArray(exposure.hard_blocks)) hard_blocks.push(...exposure.hard_blocks);
   if (!gate_results.not_blacklisted) hard_blocks.push("base_token_blacklisted");
   if (tokenTooNew) hard_blocks.push("token_too_new");
   if (tokenTooOld) hard_blocks.push("token_too_old");

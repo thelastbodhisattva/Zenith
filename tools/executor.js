@@ -1,720 +1,881 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
-import {
-  getActiveBin,
-  chooseDistributionStrategy,
-  calculateDynamicBinTiers,
-  deployPosition,
-  rebalanceOnExit,
-  autoCompoundFees,
-  getMyPositions,
-  getWalletPositions,
-  getPositionPnl,
-  claimFees,
-  closePosition,
-  searchPools,
-} from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
-import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { recordToolOutcome, setPositionInstruction } from "../state.js";
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
-import { rememberFact, recallMemory } from "../memory.js";
-import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
-import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
-import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
-import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config } from "../config.js";
-import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { execSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { appendActionLifecycle } from "../action-journal.js";
+import { config } from "../config.js";
+import {
+	addLesson,
+	clearAllLessons,
+	clearPerformance,
+	getPerformanceHistory,
+	listLessons,
+	pinLesson,
+	removeLessonsByKeyword,
+	unpinLesson,
+} from "../lessons.js";
+import { log, logAction } from "../logger.js";
+import { recallMemory, rememberFact } from "../memory.js";
+import {
+	addPoolNote,
+	getPoolDeployCooldown,
+	getPoolMemory,
+} from "../pool-memory.js";
 import { evaluatePortfolioGuard } from "../portfolio-guards.js";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { execSync, spawn } from "child_process";
+import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { evaluateDeployAdmission } from "../runtime-policy.js";
+import {
+	addSmartWallet,
+	checkSmartWalletsOnPool,
+	listSmartWallets,
+	removeSmartWallet,
+} from "../smart-wallets.js";
+import { recordToolOutcome, setPositionInstruction } from "../state.js";
+import {
+	addStrategy,
+	getStrategy,
+	listStrategies,
+	removeStrategy,
+	setActiveStrategy,
+} from "../strategy-library.js";
+import { notifyClose, notifyDeploy, notifySwap } from "../telegram.js";
+import {
+	addToBlacklist,
+	listBlacklist,
+	removeFromBlacklist,
+} from "../token-blacklist.js";
+import {
+	autoCompoundFees,
+	calculateDynamicBinTiers,
+	chooseDistributionStrategy,
+	claimFees,
+	closePosition,
+	deployPosition,
+	getActiveBin,
+	getMyPositions,
+	getPositionPnl,
+	getWalletPositions,
+	rebalanceOnExit,
+	searchPools,
+} from "./dlmm.js";
+import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
+import { getTokenHolders, getTokenInfo, getTokenNarrative } from "./token.js";
+import { getWalletBalances, swapToken } from "./wallet.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
-import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 
 const executorTestOverrides = {
-  getMyPositions: null,
-  getWalletBalances: null,
-  recordToolOutcome: null,
-  tools: {},
+	getMyPositions: null,
+	getWalletBalances: null,
+	recordToolOutcome: null,
+	tools: {},
 };
 
 export function setExecutorTestOverrides(overrides = {}) {
-  if (Object.prototype.hasOwnProperty.call(overrides, "getMyPositions")) executorTestOverrides.getMyPositions = overrides.getMyPositions;
-  if (Object.prototype.hasOwnProperty.call(overrides, "getWalletBalances")) executorTestOverrides.getWalletBalances = overrides.getWalletBalances;
-  if (Object.prototype.hasOwnProperty.call(overrides, "recordToolOutcome")) executorTestOverrides.recordToolOutcome = overrides.recordToolOutcome;
-  if (overrides.tools) executorTestOverrides.tools = { ...executorTestOverrides.tools, ...overrides.tools };
+	if (Object.hasOwn(overrides, "getMyPositions"))
+		executorTestOverrides.getMyPositions = overrides.getMyPositions;
+	if (Object.hasOwn(overrides, "getWalletBalances"))
+		executorTestOverrides.getWalletBalances = overrides.getWalletBalances;
+	if (Object.hasOwn(overrides, "recordToolOutcome"))
+		executorTestOverrides.recordToolOutcome = overrides.recordToolOutcome;
+	if (overrides.tools)
+		executorTestOverrides.tools = {
+			...executorTestOverrides.tools,
+			...overrides.tools,
+		};
 }
 
 export function resetExecutorTestOverrides() {
-  executorTestOverrides.getMyPositions = null;
-  executorTestOverrides.getWalletBalances = null;
-  executorTestOverrides.recordToolOutcome = null;
-  executorTestOverrides.tools = {};
+	executorTestOverrides.getMyPositions = null;
+	executorTestOverrides.getWalletBalances = null;
+	executorTestOverrides.recordToolOutcome = null;
+	executorTestOverrides.tools = {};
 }
 
 function getMyPositionsRuntime(args = {}) {
-  return executorTestOverrides.getMyPositions
-    ? executorTestOverrides.getMyPositions(args)
-    : getMyPositions(args);
+	return executorTestOverrides.getMyPositions
+		? executorTestOverrides.getMyPositions(args)
+		: getMyPositions(args);
 }
 
 function getWalletBalancesRuntime(args = {}) {
-  return executorTestOverrides.getWalletBalances
-    ? executorTestOverrides.getWalletBalances(args)
-    : getWalletBalances(args);
+	return executorTestOverrides.getWalletBalances
+		? executorTestOverrides.getWalletBalances(args)
+		: getWalletBalances(args);
 }
 
 function recordToolOutcomeRuntime(payload) {
-  if (executorTestOverrides.recordToolOutcome) {
-    executorTestOverrides.recordToolOutcome(payload);
-    return;
-  }
-  recordToolOutcome(payload);
+	if (executorTestOverrides.recordToolOutcome) {
+		executorTestOverrides.recordToolOutcome(payload);
+		return;
+	}
+	recordToolOutcome(payload);
 }
 
 function getToolImplementation(name) {
-  return executorTestOverrides.tools[name] || toolMap[name];
+	return executorTestOverrides.tools[name] || toolMap[name];
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
-export function registerCronRestarter(fn) { _cronRestarter = fn; }
+export function registerCronRestarter(fn) {
+	_cronRestarter = fn;
+}
 
 let _autonomousWriteSuppressed = false;
 let _writeSuppressionReason = null;
 
-export function setAutonomousWriteSuppression({ suppressed, reason = null } = {}) {
-  _autonomousWriteSuppressed = Boolean(suppressed);
-  _writeSuppressionReason = _autonomousWriteSuppressed
-    ? (reason || "manual review required")
-    : null;
+export function setAutonomousWriteSuppression({
+	suppressed,
+	reason = null,
+} = {}) {
+	_autonomousWriteSuppressed = Boolean(suppressed);
+	_writeSuppressionReason = _autonomousWriteSuppressed
+		? reason || "manual review required"
+		: null;
 }
 
 export function getAutonomousWriteSuppression() {
-  return {
-    suppressed: _autonomousWriteSuppressed,
-    reason: _writeSuppressionReason,
-  };
+	return {
+		suppressed: _autonomousWriteSuppressed,
+		reason: _writeSuppressionReason,
+	};
 }
 
 // Map tool names to implementations
 const toolMap = {
-  discover_pools: discoverPools,
-  get_top_candidates: getTopCandidates,
-  get_pool_detail: getPoolDetail,
-  get_position_pnl: getPositionPnl,
-  get_active_bin: getActiveBin,
-  choose_distribution_strategy: chooseDistributionStrategy,
-  calculate_dynamic_bin_tiers: calculateDynamicBinTiers,
-  deploy_position: deployPosition,
-  rebalance_on_exit: rebalanceOnExit,
-  auto_compound_fees: autoCompoundFees,
-  get_my_positions: getMyPositions,
-  get_wallet_positions: getWalletPositions,
-  search_pools: searchPools,
-  get_token_info: getTokenInfo,
-  get_token_holders: getTokenHolders,
-  get_token_narrative: getTokenNarrative,
-  add_smart_wallet: addSmartWallet,
-  remove_smart_wallet: removeSmartWallet,
-  list_smart_wallets: listSmartWallets,
-  check_smart_wallets_on_pool: checkSmartWalletsOnPool,
-  claim_fees: claimFees,
-  close_position: closePosition,
-  get_wallet_balance: getWalletBalances,
-  swap_token: swapToken,
-  get_top_lpers: studyTopLPers,
-  study_top_lpers: studyTopLPers,
-  score_top_lpers: scoreTopLPers,
-  get_pool_info: getPoolInfo,
-  set_position_note: ({ position_address, instruction }) => {
-    const ok = setPositionInstruction(position_address, instruction || null);
-    if (!ok) return { error: `Position ${position_address} not found in state` };
-    return { saved: true, position: position_address, instruction: instruction || null };
-  },
-  self_update: async () => {
-    try {
-      const result = execSync("git pull", { cwd: process.cwd(), encoding: "utf8" }).trim();
-      if (result.includes("Already up to date")) {
-        return { success: true, updated: false, message: "Already up to date — no restart needed." };
-      }
-      // Delay restart so this tool response (and Telegram message) gets sent first
-      setTimeout(() => {
-        const child = spawn(process.execPath, process.argv.slice(1), {
-          detached: true,
-          stdio: "inherit",
-          cwd: process.cwd(),
-        });
-        child.unref();
-        process.exit(0);
-      }, 3000);
-      return { success: true, updated: true, message: `Updated! Restarting in 3s...\n${result}` };
-    } catch (e) {
-      return { success: false, error: e.message };
-    }
-  },
-  get_performance_history: getPerformanceHistory,
-  add_strategy:        addStrategy,
-  list_strategies:     listStrategies,
-  get_strategy:        getStrategy,
-  set_active_strategy: setActiveStrategy,
-  remove_strategy:     removeStrategy,
-  get_pool_memory: getPoolMemory,
-  add_pool_note: addPoolNote,
-  add_to_blacklist: addToBlacklist,
-  remove_from_blacklist: removeFromBlacklist,
-  list_blacklist: listBlacklist,
-  add_lesson: ({ rule, tags, pinned, role }) => {
-    addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
-    return { saved: true, rule, pinned: !!pinned, role: role || "all" };
-  },
-  remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
-  recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
-  pin_lesson:   ({ id }) => pinLesson(id),
-  unpin_lesson: ({ id }) => unpinLesson(id),
-  list_lessons: ({ role, pinned, tag, limit } = {}) => listLessons({ role, pinned, tag, limit }),
-  clear_lessons: ({ mode, keyword }) => {
-    if (mode === "all") {
-      const n = clearAllLessons();
-      log("lessons", `Cleared all ${n} lessons`);
-      return { cleared: n, mode: "all" };
-    }
-    if (mode === "performance") {
-      const n = clearPerformance();
-      log("lessons", `Cleared ${n} performance records`);
-      return { cleared: n, mode: "performance" };
-    }
-    if (mode === "keyword") {
-      if (!keyword) return { error: "keyword required for mode=keyword" };
-      const n = removeLessonsByKeyword(keyword);
-      log("lessons", `Cleared ${n} lessons matching "${keyword}"`);
-      return { cleared: n, mode: "keyword", keyword };
-    }
-    return { error: "invalid mode" };
-  },
-  update_config: ({ changes, reason = "" }) => {
-    // Flat key → config section mapping (covers everything in config.js)
-    const CONFIG_MAP = {
-      // screening
-      minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
-      minTvl: ["screening", "minTvl"],
-      maxTvl: ["screening", "maxTvl"],
-      minVolume: ["screening", "minVolume"],
-      minOrganic: ["screening", "minOrganic"],
-      minHolders: ["screening", "minHolders"],
-      minMcap: ["screening", "minMcap"],
-      maxMcap: ["screening", "maxMcap"],
-      minBinStep: ["screening", "minBinStep"],
-      maxBinStep: ["screening", "maxBinStep"],
-      timeframe: ["screening", "timeframe"],
-      category: ["screening", "category"],
-      minTokenFeesSol: ["screening", "minTokenFeesSol"],
-      maxBundlersPct: ["screening", "maxBundlersPct"],
-      maxTop10Pct: ["screening", "maxTop10Pct"],
-      // protections
-      protectionsEnabled: ["protections", "enabled"],
-      maxRecentRealizedLossUsd: ["protections", "maxRecentRealizedLossUsd"],
-      maxDrawdownPct: ["protections", "maxDrawdownPct"],
-      maxOpenUnrealizedLossUsd: ["protections", "maxOpenUnrealizedLossUsd"],
-      recentLossWindowHours: ["protections", "recentLossWindowHours"],
-      stopLossStreakLimit: ["protections", "stopLossStreakLimit"],
-      portfolioPauseMinutes: ["protections", "pauseMinutes"],
-      maxReviewedCloses: ["protections", "maxReviewedCloses"],
-      recoveryResumeOverrideMinutes: ["protections", "recoveryResumeOverrideMinutes"],
-      // management
-      minClaimAmount: ["management", "minClaimAmount"],
-      autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
-      outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
-      outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
-      minVolumeToRebalance: ["management", "minVolumeToRebalance"],
-      emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
-      stopLossPct: ["management", "stopLossPct"],
-      takeProfitFeePct: ["management", "takeProfitFeePct"],
-      trailingTakeProfit: ["management", "trailingTakeProfit"],
-      trailingTriggerPct: ["management", "trailingTriggerPct"],
-      trailingDropPct: ["management", "trailingDropPct"],
-      minSolToOpen: ["management", "minSolToOpen"],
-      deployAmountSol: ["management", "deployAmountSol"],
-      gasReserve: ["management", "gasReserve"],
-      positionSizePct: ["management", "positionSizePct"],
-      // risk
-      maxPositions: ["risk", "maxPositions"],
-      maxDeployAmount: ["risk", "maxDeployAmount"],
-      // schedule
-      managementIntervalMin: ["schedule", "managementIntervalMin"],
-      screeningIntervalMin: ["schedule", "screeningIntervalMin"],
-      // models
-      managementModel: ["llm", "managementModel"],
-      screeningModel: ["llm", "screeningModel"],
-      generalModel: ["llm", "generalModel"],
-      // strategy
-      binsBelow: ["strategy", "binsBelow"],
-    };
+	discover_pools: discoverPools,
+	get_top_candidates: getTopCandidates,
+	get_pool_detail: getPoolDetail,
+	get_position_pnl: getPositionPnl,
+	get_active_bin: getActiveBin,
+	choose_distribution_strategy: chooseDistributionStrategy,
+	calculate_dynamic_bin_tiers: calculateDynamicBinTiers,
+	deploy_position: deployPosition,
+	rebalance_on_exit: rebalanceOnExit,
+	auto_compound_fees: autoCompoundFees,
+	get_my_positions: getMyPositions,
+	get_wallet_positions: getWalletPositions,
+	search_pools: searchPools,
+	get_token_info: getTokenInfo,
+	get_token_holders: getTokenHolders,
+	get_token_narrative: getTokenNarrative,
+	add_smart_wallet: addSmartWallet,
+	remove_smart_wallet: removeSmartWallet,
+	list_smart_wallets: listSmartWallets,
+	check_smart_wallets_on_pool: checkSmartWalletsOnPool,
+	claim_fees: claimFees,
+	close_position: closePosition,
+	get_wallet_balance: getWalletBalances,
+	swap_token: swapToken,
+	get_top_lpers: studyTopLPers,
+	study_top_lpers: studyTopLPers,
+	score_top_lpers: scoreTopLPers,
+	get_pool_info: getPoolInfo,
+	set_position_note: ({ position_address, instruction }) => {
+		const ok = setPositionInstruction(position_address, instruction || null);
+		if (!ok)
+			return { error: `Position ${position_address} not found in state` };
+		return {
+			saved: true,
+			position: position_address,
+			instruction: instruction || null,
+		};
+	},
+	self_update: async () => {
+		try {
+			const result = execSync("git pull", {
+				cwd: process.cwd(),
+				encoding: "utf8",
+			}).trim();
+			if (result.includes("Already up to date")) {
+				return {
+					success: true,
+					updated: false,
+					message: "Already up to date — no restart needed.",
+				};
+			}
+			// Delay restart so this tool response (and Telegram message) gets sent first
+			setTimeout(() => {
+				const child = spawn(process.execPath, process.argv.slice(1), {
+					detached: true,
+					stdio: "inherit",
+					cwd: process.cwd(),
+				});
+				child.unref();
+				process.exit(0);
+			}, 3000);
+			return {
+				success: true,
+				updated: true,
+				message: `Updated! Restarting in 3s...\n${result}`,
+			};
+		} catch (e) {
+			return { success: false, error: e.message };
+		}
+	},
+	get_performance_history: getPerformanceHistory,
+	add_strategy: addStrategy,
+	list_strategies: listStrategies,
+	get_strategy: getStrategy,
+	set_active_strategy: setActiveStrategy,
+	remove_strategy: removeStrategy,
+	get_pool_memory: getPoolMemory,
+	add_pool_note: addPoolNote,
+	add_to_blacklist: addToBlacklist,
+	remove_from_blacklist: removeFromBlacklist,
+	list_blacklist: listBlacklist,
+	add_lesson: ({ rule, tags, pinned, role }) => {
+		addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
+		return { saved: true, rule, pinned: !!pinned, role: role || "all" };
+	},
+	remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
+	recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
+	pin_lesson: ({ id }) => pinLesson(id),
+	unpin_lesson: ({ id }) => unpinLesson(id),
+	list_lessons: ({ role, pinned, tag, limit } = {}) =>
+		listLessons({ role, pinned, tag, limit }),
+	clear_lessons: ({ mode, keyword }) => {
+		if (mode === "all") {
+			const n = clearAllLessons();
+			log("lessons", `Cleared all ${n} lessons`);
+			return { cleared: n, mode: "all" };
+		}
+		if (mode === "performance") {
+			const n = clearPerformance();
+			log("lessons", `Cleared ${n} performance records`);
+			return { cleared: n, mode: "performance" };
+		}
+		if (mode === "keyword") {
+			if (!keyword) return { error: "keyword required for mode=keyword" };
+			const n = removeLessonsByKeyword(keyword);
+			log("lessons", `Cleared ${n} lessons matching "${keyword}"`);
+			return { cleared: n, mode: "keyword", keyword };
+		}
+		return { error: "invalid mode" };
+	},
+	update_config: ({ changes, reason = "" }) => {
+		// Flat key → config section mapping (covers everything in config.js)
+		const CONFIG_MAP = {
+			// screening
+			minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
+			minTvl: ["screening", "minTvl"],
+			maxTvl: ["screening", "maxTvl"],
+			minVolume: ["screening", "minVolume"],
+			minOrganic: ["screening", "minOrganic"],
+			minHolders: ["screening", "minHolders"],
+			minMcap: ["screening", "minMcap"],
+			maxMcap: ["screening", "maxMcap"],
+			minBinStep: ["screening", "minBinStep"],
+			maxBinStep: ["screening", "maxBinStep"],
+			timeframe: ["screening", "timeframe"],
+			category: ["screening", "category"],
+			minTokenFeesSol: ["screening", "minTokenFeesSol"],
+			maxBundlersPct: ["screening", "maxBundlersPct"],
+			maxTop10Pct: ["screening", "maxTop10Pct"],
+			// protections
+			protectionsEnabled: ["protections", "enabled"],
+			maxRecentRealizedLossUsd: ["protections", "maxRecentRealizedLossUsd"],
+			maxDrawdownPct: ["protections", "maxDrawdownPct"],
+			maxOpenUnrealizedLossUsd: ["protections", "maxOpenUnrealizedLossUsd"],
+			recentLossWindowHours: ["protections", "recentLossWindowHours"],
+			stopLossStreakLimit: ["protections", "stopLossStreakLimit"],
+			portfolioPauseMinutes: ["protections", "pauseMinutes"],
+			maxReviewedCloses: ["protections", "maxReviewedCloses"],
+			recoveryResumeOverrideMinutes: [
+				"protections",
+				"recoveryResumeOverrideMinutes",
+			],
+			// management
+			minClaimAmount: ["management", "minClaimAmount"],
+			autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
+			outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
+			outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+			minVolumeToRebalance: ["management", "minVolumeToRebalance"],
+			emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
+			stopLossPct: ["management", "stopLossPct"],
+			takeProfitFeePct: ["management", "takeProfitFeePct"],
+			trailingTakeProfit: ["management", "trailingTakeProfit"],
+			trailingTriggerPct: ["management", "trailingTriggerPct"],
+			trailingDropPct: ["management", "trailingDropPct"],
+			minSolToOpen: ["management", "minSolToOpen"],
+			deployAmountSol: ["management", "deployAmountSol"],
+			gasReserve: ["management", "gasReserve"],
+			positionSizePct: ["management", "positionSizePct"],
+			// risk
+			maxPositions: ["risk", "maxPositions"],
+			maxDeployAmount: ["risk", "maxDeployAmount"],
+			// schedule
+			managementIntervalMin: ["schedule", "managementIntervalMin"],
+			screeningIntervalMin: ["schedule", "screeningIntervalMin"],
+			// models
+			managementModel: ["llm", "managementModel"],
+			screeningModel: ["llm", "screeningModel"],
+			generalModel: ["llm", "generalModel"],
+			// strategy
+			binsBelow: ["strategy", "binsBelow"],
+		};
 
-    const applied = {};
-    const unknown = [];
+		const applied = {};
+		const unknown = [];
 
-    // Build case-insensitive lookup
-    const CONFIG_MAP_LOWER = Object.fromEntries(
-      Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]])
-    );
+		// Build case-insensitive lookup
+		const CONFIG_MAP_LOWER = Object.fromEntries(
+			Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]]),
+		);
 
-    for (const [key, val] of Object.entries(changes)) {
-      const match = CONFIG_MAP[key] ? [key, CONFIG_MAP[key]] : CONFIG_MAP_LOWER[key.toLowerCase()];
-      if (!match) { unknown.push(key); continue; }
-      applied[match[0]] = val;
-    }
+		for (const [key, val] of Object.entries(changes)) {
+			const match = CONFIG_MAP[key]
+				? [key, CONFIG_MAP[key]]
+				: CONFIG_MAP_LOWER[key.toLowerCase()];
+			if (!match) {
+				unknown.push(key);
+				continue;
+			}
+			applied[match[0]] = val;
+		}
 
-    if (Object.keys(applied).length === 0) {
-      log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`);
-      return { success: false, unknown, reason };
-    }
+		if (Object.keys(applied).length === 0) {
+			log(
+				"config",
+				`update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`,
+			);
+			return { success: false, unknown, reason };
+		}
 
-    // Apply to live config immediately
-    const effectiveApplied = {};
-    for (const [key, val] of Object.entries(applied)) {
-      const [section, field] = CONFIG_MAP[key];
-      const before = config[section][field];
-      if (Object.is(before, val)) continue;
-      effectiveApplied[key] = val;
-      config[section][field] = val;
-      log("config", `update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`);
-    }
+		// Apply to live config immediately
+		const effectiveApplied = {};
+		for (const [key, val] of Object.entries(applied)) {
+			const [section, field] = CONFIG_MAP[key];
+			const before = config[section][field];
+			if (Object.is(before, val)) continue;
+			effectiveApplied[key] = val;
+			config[section][field] = val;
+			log(
+				"config",
+				`update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`,
+			);
+		}
 
-    if (Object.keys(effectiveApplied).length === 0) {
-      return { success: true, applied: {}, unknown, reason, noop: true };
-    }
+		if (Object.keys(effectiveApplied).length === 0) {
+			return { success: true, applied: {}, unknown, reason, noop: true };
+		}
 
-    // Persist to user-config.json
-    let userConfig = {};
-    if (fs.existsSync(USER_CONFIG_PATH)) {
-      try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /**/ }
-    }
-    Object.assign(userConfig, effectiveApplied);
-    userConfig._lastAgentTune = new Date().toISOString();
-    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+		// Persist to user-config.json
+		let userConfig = {};
+		if (fs.existsSync(USER_CONFIG_PATH)) {
+			try {
+				userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+			} catch {
+				/**/
+			}
+		}
+		Object.assign(userConfig, effectiveApplied);
+		userConfig._lastAgentTune = new Date().toISOString();
+		fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
-    // Restart cron jobs if intervals changed
-    const intervalChanged = effectiveApplied.managementIntervalMin != null || effectiveApplied.screeningIntervalMin != null;
-    if (intervalChanged && _cronRestarter) {
-      _cronRestarter();
-      log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
-    }
+		// Restart cron jobs if intervals changed
+		const intervalChanged =
+			effectiveApplied.managementIntervalMin != null ||
+			effectiveApplied.screeningIntervalMin != null;
+		if (intervalChanged && _cronRestarter) {
+			_cronRestarter();
+			log(
+				"config",
+				`Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`,
+			);
+		}
 
-    // Save as a lesson — but skip ephemeral per-deploy interval changes
-    // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
-    //  the rule is already in the system prompt, storing it 75+ times is pure noise)
-    const lessonsKeys = Object.keys(effectiveApplied).filter(
-      k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
-    );
-    if (lessonsKeys.length > 0) {
-      const summary = lessonsKeys.map(k => `${k}=${effectiveApplied[k]}`).join(", ");
-      addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, ["self_tune", "config_change"]);
-    }
+		// Save as a lesson — but skip ephemeral per-deploy interval changes
+		// (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
+		//  the rule is already in the system prompt, storing it 75+ times is pure noise)
+		const lessonsKeys = Object.keys(effectiveApplied).filter(
+			(k) => k !== "managementIntervalMin" && k !== "screeningIntervalMin",
+		);
+		if (lessonsKeys.length > 0) {
+			const summary = lessonsKeys
+				.map((k) => `${k}=${effectiveApplied[k]}`)
+				.join(", ");
+			addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, [
+				"self_tune",
+				"config_change",
+			]);
+		}
 
-    log("config", `Agent self-tuned: ${JSON.stringify(effectiveApplied)} — ${reason}`);
-    return { success: true, applied: effectiveApplied, unknown, reason };
-  },
+		log(
+			"config",
+			`Agent self-tuned: ${JSON.stringify(effectiveApplied)} — ${reason}`,
+		);
+		return { success: true, applied: effectiveApplied, unknown, reason };
+	},
 };
 
 // Tools that modify on-chain state (need extra safety checks)
 const WRITE_TOOLS = new Set([
-  "deploy_position",
-  "rebalance_on_exit",
-  "auto_compound_fees",
-  "claim_fees",
-  "close_position",
-  "swap_token",
+	"deploy_position",
+	"rebalance_on_exit",
+	"auto_compound_fees",
+	"claim_fees",
+	"close_position",
+	"swap_token",
 ]);
+
+function buildDecisionContext(meta = {}, workflowId) {
+	return {
+		cycle_id: meta.cycle_id || null,
+		cycle_type: meta.cycle_type || null,
+		action_id: meta.action_id || workflowId,
+		workflow_id: workflowId,
+		regime_label: meta.regime_label || null,
+	};
+}
+
+function attachWriteDecisionContext(args, meta = {}, workflowId) {
+	return {
+		...(args || {}),
+		decision_context: {
+			...(args?.decision_context || {}),
+			...buildDecisionContext(meta, workflowId),
+		},
+	};
+}
+
+function appendWriteLifecycleEntry({
+	workflowId,
+	lifecycle,
+	name,
+	args,
+	meta = {},
+	reason = null,
+}) {
+	if (!workflowId) return;
+	appendActionLifecycle({
+		workflow_id: workflowId,
+		lifecycle,
+		tool: name,
+		cycle_id: meta.cycle_id || null,
+		action_id: meta.action_id || null,
+		position_address: args?.position_address || null,
+		pool_address: args?.pool_address || null,
+		reason,
+	});
+}
+
+function recordWriteToolOutcome({
+	tool,
+	outcome,
+	reason = null,
+	args,
+	meta = {},
+	result = null,
+}) {
+	recordToolOutcomeRuntime({
+		tool,
+		outcome,
+		reason,
+		metadata: {
+			pool_address:
+				args?.pool_address || result?.pool_address || result?.pool || null,
+			position_address: args?.position_address || result?.position || null,
+			cycle_id: meta.cycle_id || null,
+			action_id: meta.action_id || null,
+			blocked_by_recovery:
+				outcome === "blocked" && Boolean(meta.blocked_by_recovery),
+		},
+	});
+}
+
+async function handleSuccessfulToolSideEffects(name, normalizedArgs, result) {
+	if (name === "swap_token" && result.tx) {
+		await notifySwap({
+			inputSymbol: normalizedArgs.input_mint?.slice(0, 8),
+			outputSymbol:
+				normalizedArgs.output_mint ===
+					"So11111111111111111111111111111111111111112" ||
+				normalizedArgs.output_mint === "SOL"
+					? "SOL"
+					: normalizedArgs.output_mint?.slice(0, 8),
+			amountIn: result.amount_in,
+			amountOut: result.amount_out,
+			tx: result.tx,
+		}).catch(() => {});
+		return;
+	}
+
+	if (name === "deploy_position") {
+		await notifyDeploy({
+			pair:
+				result.pool_name ||
+				normalizedArgs.pool_name ||
+				normalizedArgs.pool_address?.slice(0, 8),
+			amountSol: normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0,
+			position: result.position,
+			tx: result.txs?.[0] ?? result.tx,
+			priceRange: result.price_range,
+			binStep: result.bin_step,
+			baseFee: result.base_fee,
+		}).catch(() => {});
+		return;
+	}
+
+	if (name === "close_position") {
+		await notifyClose({
+			pair: result.pool_name || normalizedArgs.position_address?.slice(0, 8),
+			pnlUsd: result.pnl_usd ?? 0,
+			pnlPct: result.pnl_pct ?? 0,
+		}).catch(() => {});
+		if (!normalizedArgs.skip_swap && result.base_mint) {
+			try {
+				const balances = await getWalletBalancesRuntime({});
+				const token = balances.tokens?.find(
+					(entry) => entry.mint === result.base_mint,
+				);
+				if (token && token.usd >= 0.1) {
+					log(
+						"executor",
+						`Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`,
+					);
+					await swapToken({
+						input_mint: result.base_mint,
+						output_mint: "SOL",
+						amount: token.balance,
+					});
+				}
+			} catch (error) {
+				log("executor_warn", `Auto-swap after close failed: ${error.message}`);
+			}
+		}
+		return;
+	}
+
+	if (
+		name === "claim_fees" &&
+		config.management.autoSwapAfterClaim &&
+		result.base_mint
+	) {
+		try {
+			const balances = await getWalletBalancesRuntime({});
+			const token = balances.tokens?.find(
+				(entry) => entry.mint === result.base_mint,
+			);
+			if (token && token.usd >= 0.1) {
+				log(
+					"executor",
+					`Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`,
+				);
+				await swapToken({
+					input_mint: result.base_mint,
+					output_mint: "SOL",
+					amount: token.balance,
+				});
+			}
+		} catch (error) {
+			log("executor_warn", `Auto-swap after claim failed: ${error.message}`);
+		}
+	}
+}
 
 /**
  * Execute a tool call with safety checks and logging.
  */
 export async function executeTool(name, args, meta = {}) {
-  const startTime = Date.now();
-  let normalizedArgs = args;
-  let workflowId = null;
+	const startTime = Date.now();
+	let normalizedArgs = args;
+	let workflowId = null;
 
-  function appendManualReviewTerminal(reason) {
-    if (!workflowId) return;
-    appendActionLifecycle({
-      workflow_id: workflowId,
-      lifecycle: "manual_review",
-      tool: name,
-      cycle_id: meta.cycle_id || null,
-      action_id: meta.action_id || null,
-      position_address: normalizedArgs?.position_address || null,
-      pool_address: normalizedArgs?.pool_address || null,
-      reason,
-    });
-  }
+	function appendManualReviewTerminal(reason) {
+		appendWriteLifecycleEntry({
+			workflowId,
+			lifecycle: "manual_review",
+			name,
+			args: normalizedArgs,
+			meta,
+			reason,
+		});
+	}
 
-  // ─── Validate tool exists ─────────────────
-  const fn = getToolImplementation(name);
-  if (!fn) {
-    const error = `Unknown tool: ${name}`;
-    log("error", error);
-    return { error };
-  }
+	// ─── Validate tool exists ─────────────────
+	const fn = getToolImplementation(name);
+	if (!fn) {
+		const error = `Unknown tool: ${name}`;
+		log("error", error);
+		return { error };
+	}
 
-  if (name === "deploy_position" && normalizedArgs && normalizedArgs.initial_value_usd == null) {
-    const wallet = await getWalletBalancesRuntime({}).catch(() => null);
-    const solPrice = Number(wallet?.sol_price) || 0;
-    const solLeg = Number(normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0);
-    if (solPrice > 0 && solLeg > 0) {
-      normalizedArgs = {
-        ...normalizedArgs,
-        initial_value_usd: estimateInitialValueUsd({ amountSol: solLeg, solPrice }),
-      };
-      log("executor", `Derived initial_value_usd=$${normalizedArgs.initial_value_usd} from SOL leg for deploy_position`);
-    }
-  }
+	if (
+		name === "deploy_position" &&
+		normalizedArgs &&
+		normalizedArgs.initial_value_usd == null
+	) {
+		const wallet = await getWalletBalancesRuntime({}).catch(() => null);
+		const solPrice = Number(wallet?.sol_price) || 0;
+		const solLeg = Number(
+			normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0,
+		);
+		if (solPrice > 0 && solLeg > 0) {
+			normalizedArgs = {
+				...normalizedArgs,
+				initial_value_usd: estimateInitialValueUsd({
+					amountSol: solLeg,
+					solPrice,
+				}),
+			};
+			log(
+				"executor",
+				`Derived initial_value_usd=$${normalizedArgs.initial_value_usd} from SOL leg for deploy_position`,
+			);
+		}
+	}
 
-  // ─── Pre-execution safety checks ──────────
-  if (WRITE_TOOLS.has(name)) {
-    if (_autonomousWriteSuppressed) {
-      const reason = _writeSuppressionReason || "manual review required before autonomous writes can resume";
-      recordToolOutcomeRuntime({
-        tool: name,
-        outcome: "blocked",
-        reason,
-        metadata: {
-          pool_address: normalizedArgs?.pool_address || null,
-          position_address: normalizedArgs?.position_address || null,
-          cycle_id: meta.cycle_id || null,
-          action_id: meta.action_id || null,
-          blocked_by_recovery: true,
-        },
-      });
-      return {
-        blocked: true,
-        reason,
-      };
-    }
+	// ─── Pre-execution safety checks ──────────
+	if (WRITE_TOOLS.has(name)) {
+		if (_autonomousWriteSuppressed) {
+			const reason =
+				_writeSuppressionReason ||
+				"manual review required before autonomous writes can resume";
+			recordToolOutcomeRuntime({
+				tool: name,
+				outcome: "blocked",
+				reason,
+				metadata: {
+					pool_address: normalizedArgs?.pool_address || null,
+					position_address: normalizedArgs?.position_address || null,
+					cycle_id: meta.cycle_id || null,
+					action_id: meta.action_id || null,
+					blocked_by_recovery: true,
+				},
+			});
+			return {
+				blocked: true,
+				reason,
+			};
+		}
 
-    workflowId = meta.action_id || `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    appendActionLifecycle({
-      workflow_id: workflowId,
-      lifecycle: "intent",
-      tool: name,
-      cycle_id: meta.cycle_id || null,
-      action_id: meta.action_id || null,
-      position_address: normalizedArgs?.position_address || null,
-      pool_address: normalizedArgs?.pool_address || null,
-    });
+		workflowId =
+			meta.action_id ||
+			`${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		normalizedArgs = attachWriteDecisionContext(
+			normalizedArgs,
+			meta,
+			workflowId,
+		);
+		appendWriteLifecycleEntry({
+			workflowId,
+			lifecycle: "intent",
+			name,
+			args: normalizedArgs,
+			meta,
+		});
 
-    if (name === "rebalance_on_exit") {
-      normalizedArgs = {
-        ...normalizedArgs,
-        journal_workflow_id: workflowId,
-      };
-    }
+		if (name === "rebalance_on_exit") {
+			normalizedArgs = {
+				...normalizedArgs,
+				journal_workflow_id: workflowId,
+			};
+		}
 
-    const safetyCheck = await runSafetyChecks(name, normalizedArgs);
-    if (!safetyCheck.pass) {
-      log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
-      appendManualReviewTerminal("write_intent_blocked_by_safety_checks");
-      recordToolOutcomeRuntime({
-        tool: name,
-        outcome: "blocked",
-        reason: safetyCheck.reason,
-        metadata: {
-          pool_address: normalizedArgs?.pool_address || null,
-          position_address: normalizedArgs?.position_address || null,
-          cycle_id: meta.cycle_id || null,
-          action_id: meta.action_id || null,
-        },
-      });
-      return {
-        blocked: true,
-        reason: safetyCheck.reason,
-      };
-    }
-  }
+		const safetyCheck = await runSafetyChecks(name, normalizedArgs);
+		if (!safetyCheck.pass) {
+			log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+			appendManualReviewTerminal("write_intent_blocked_by_safety_checks");
+			recordWriteToolOutcome({
+				tool: name,
+				outcome: "blocked",
+				reason: safetyCheck.reason,
+				args: normalizedArgs,
+				meta,
+			});
+			return {
+				blocked: true,
+				reason: safetyCheck.reason,
+			};
+		}
+	}
 
-  // ─── Execute ──────────────────────────────
-  try {
-    const result = await fn(normalizedArgs);
-    const duration = Date.now() - startTime;
-    const success = result?.success !== false && !result?.error;
+	// ─── Execute ──────────────────────────────
+	try {
+		const result = await fn(normalizedArgs);
+		const duration = Date.now() - startTime;
+		const success = result?.success !== false && !result?.error;
 
-    logAction({
-      tool: name,
-      args: normalizedArgs,
-      result: summarizeResult(result),
-      duration_ms: duration,
-      success,
-      cycle_id: meta.cycle_id || null,
-      action_id: meta.action_id || null,
-    });
+		logAction({
+			tool: name,
+			args: normalizedArgs,
+			result: summarizeResult(result),
+			duration_ms: duration,
+			success,
+			cycle_id: meta.cycle_id || null,
+			action_id: meta.action_id || null,
+		});
 
-    if (success) {
-      if (WRITE_TOOLS.has(name)) {
-        if (workflowId) {
-          appendActionLifecycle({
-            workflow_id: workflowId,
-            lifecycle: "completed",
-            tool: name,
-            cycle_id: meta.cycle_id || null,
-            action_id: meta.action_id || null,
-            position_address: normalizedArgs?.position_address || result?.position || null,
-            pool_address: normalizedArgs?.pool_address || result?.pool || result?.pool_address || null,
-          });
-        }
-        recordToolOutcomeRuntime({
-          tool: name,
-          outcome: "success",
-          metadata: {
-            pool_address: normalizedArgs?.pool_address || result?.pool_address || null,
-            position_address: normalizedArgs?.position_address || result?.position || null,
-            cycle_id: meta.cycle_id || null,
-            action_id: meta.action_id || null,
-          },
-        });
-      }
-      if (name === "swap_token" && result.tx) {
-        notifySwap({ inputSymbol: normalizedArgs.input_mint?.slice(0, 8), outputSymbol: normalizedArgs.output_mint === "So11111111111111111111111111111111111111112" || normalizedArgs.output_mint === "SOL" ? "SOL" : normalizedArgs.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
-      } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || normalizedArgs.pool_name || normalizedArgs.pool_address?.slice(0, 8), amountSol: normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
-      } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || normalizedArgs.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
-        // Auto-swap base token back to SOL unless user said to hold
-        if (!normalizedArgs.skip_swap && result.base_mint) {
-          try {
-            const balances = await getWalletBalancesRuntime({});
-            const token = balances.tokens?.find(t => t.mint === result.base_mint);
-            if (token && token.usd >= 0.10) {
-              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
-            }
-          } catch (e) {
-            log("executor_warn", `Auto-swap after close failed: ${e.message}`);
-          }
-        }
-      } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
-        try {
-          const balances = await getWalletBalancesRuntime({});
-          const token = balances.tokens?.find(t => t.mint === result.base_mint);
-          if (token && token.usd >= 0.10) {
-            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
-          }
-        } catch (e) {
-          log("executor_warn", `Auto-swap after claim failed: ${e.message}`);
-        }
-      }
-    }
+		if (success) {
+			if (WRITE_TOOLS.has(name)) {
+				appendWriteLifecycleEntry({
+					workflowId,
+					lifecycle: "completed",
+					name,
+					args: {
+						...normalizedArgs,
+						position_address:
+							normalizedArgs?.position_address || result?.position || null,
+						pool_address:
+							normalizedArgs?.pool_address ||
+							result?.pool ||
+							result?.pool_address ||
+							null,
+					},
+					meta,
+				});
+				recordWriteToolOutcome({
+					tool: name,
+					outcome: "success",
+					args: normalizedArgs,
+					meta,
+					result,
+				});
+			}
+			await handleSuccessfulToolSideEffects(name, normalizedArgs, result);
+		}
 
-    if (!success && WRITE_TOOLS.has(name)) {
-      const reason = result?.error || "write_tool_reported_unsuccessful_result";
-      appendManualReviewTerminal(reason);
-      recordToolOutcomeRuntime({
-        tool: name,
-        outcome: "error",
-        reason,
-        metadata: {
-          pool_address: normalizedArgs?.pool_address || null,
-          position_address: normalizedArgs?.position_address || null,
-          cycle_id: meta.cycle_id || null,
-          action_id: meta.action_id || null,
-        },
-      });
-    }
+		if (!success && WRITE_TOOLS.has(name)) {
+			const reason = result?.error || "write_tool_reported_unsuccessful_result";
+			appendManualReviewTerminal(reason);
+			recordWriteToolOutcome({
+				tool: name,
+				outcome: "error",
+				reason,
+				args: normalizedArgs,
+				meta,
+				result,
+			});
+		}
 
-    return result;
-  } catch (error) {
-    const duration = Date.now() - startTime;
+		return result;
+	} catch (error) {
+		const duration = Date.now() - startTime;
 
-    if (WRITE_TOOLS.has(name)) {
-      appendManualReviewTerminal(error.message || "write_tool_execution_error");
-      recordToolOutcomeRuntime({
-        tool: name,
-        outcome: "error",
-        reason: error.message,
-        metadata: {
-          pool_address: normalizedArgs?.pool_address || null,
-          position_address: normalizedArgs?.position_address || null,
-          cycle_id: meta.cycle_id || null,
-          action_id: meta.action_id || null,
-        },
-      });
-    }
+		if (WRITE_TOOLS.has(name)) {
+			appendManualReviewTerminal(error.message || "write_tool_execution_error");
+			recordWriteToolOutcome({
+				tool: name,
+				outcome: "error",
+				reason: error.message,
+				args: normalizedArgs,
+				meta,
+			});
+		}
 
-    logAction({
-      tool: name,
-      args: normalizedArgs,
-      error: error.message,
-      duration_ms: duration,
-      success: false,
-      cycle_id: meta.cycle_id || null,
-      action_id: meta.action_id || null,
-    });
+		logAction({
+			tool: name,
+			args: normalizedArgs,
+			error: error.message,
+			duration_ms: duration,
+			success: false,
+			cycle_id: meta.cycle_id || null,
+			action_id: meta.action_id || null,
+		});
 
-    // Return error to LLM so it can decide what to do
-    return {
-      error: error.message,
-      tool: name,
-    };
-  }
+		// Return error to LLM so it can decide what to do
+		return {
+			error: error.message,
+			tool: name,
+		};
+	}
 }
 
 /**
  * Run safety checks before executing write operations.
  */
 export async function runSafetyChecks(name, args) {
-  switch (name) {
-    case "deploy_position": {
-      const portfolioGuard = evaluatePortfolioGuard();
-      if (portfolioGuard.blocked) {
-        return {
-          pass: false,
-          reason: `Portfolio guard active: ${portfolioGuard.reason}`,
-        };
-      }
+	switch (name) {
+		case "deploy_position": {
+			const portfolioGuard = evaluatePortfolioGuard();
+			const positions = await getMyPositionsRuntime({ force: true });
+			const balance = await getWalletBalancesRuntime();
+			const deployAdmission = evaluateDeployAdmission({
+				config,
+				poolAddress: args.pool_address,
+				baseMint: args.base_mint,
+				amountY: args.amount_y ?? args.amount_sol ?? 0,
+				amountX: args.amount_x ?? 0,
+				binStep: args.bin_step,
+				positions: positions.positions,
+				positionsCount: positions.total_positions,
+				walletSol: balance.sol,
+				portfolioGuard,
+				poolCooldown: getPoolDeployCooldown({
+					pool_address: args.pool_address,
+				}),
+			});
 
-      // Reject pools with bin_step out of configured range
-      const minStep = config.screening.minBinStep;
-      const maxStep = config.screening.maxBinStep;
-      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
-        return {
-          pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
-        };
-      }
+			return deployAdmission.pass
+				? { pass: true }
+				: { pass: false, reason: deployAdmission.message };
+		}
 
-      // Check position count limit + duplicate pool guard
-      const positions = await getMyPositionsRuntime({ force: true });
-      if (positions.total_positions >= config.risk.maxPositions) {
-        return {
-          pass: false,
-          reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
-        };
-      }
-      const alreadyInPool = positions.positions.some(
-        (p) => p.pool === args.pool_address
-      );
-      if (alreadyInPool) {
-        return {
-          pass: false,
-          reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
-        };
-      }
+		case "swap_token": {
+			// Basic check — prevent swapping when DRY_RUN is true
+			// (handled inside swapToken itself, but belt-and-suspenders)
+			return { pass: true };
+		}
 
-      // Block same base token across different pools
-      if (args.base_mint) {
-        const alreadyHasMint = positions.positions.some(
-          (p) => p.base_mint === args.base_mint
-        );
-        if (alreadyHasMint) {
-          return {
-            pass: false,
-            reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
-          };
-        }
-      }
+		case "rebalance_on_exit":
+		case "auto_compound_fees": {
+			const portfolioGuard = evaluatePortfolioGuard();
+			if (portfolioGuard.blocked) {
+				return {
+					pass: false,
+					reason: `Portfolio guard active: ${portfolioGuard.reason}`,
+				};
+			}
 
-      // Check amount limits
-      const amountY = args.amount_y ?? args.amount_sol ?? 0;
-      if (amountY <= 0 && (!args.amount_x || args.amount_x <= 0)) {
-        return {
-          pass: false,
-          reason: `Must provide a positive amount for either SOL (amount_y) or base token (amount_x).`,
-        };
-      }
+			if (!args?.position_address) {
+				return {
+					pass: false,
+					reason: "position_address is required.",
+				};
+			}
+			return { pass: true };
+		}
 
-      // Enforce minimum deploy amount — must be at least deployAmountSol (configured) or 0.1 SOL absolute floor.
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
-        return {
-          pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
-        };
-      }
-      if (amountY > config.risk.maxDeployAmount) {
-        return {
-          pass: false,
-          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
-        };
-      }
+		case "claim_fees":
+		case "close_position": {
+			if (!args?.position_address) {
+				return {
+					pass: false,
+					reason: "position_address is required.",
+				};
+			}
 
-      // Check SOL balance — must have enough to deploy + gas reserve
-      const balance = await getWalletBalancesRuntime();
-      const gasReserve = config.management.gasReserve;
-      const minRequired = amountY + gasReserve;
-      if (balance.sol < minRequired) {
-        return {
-          pass: false,
-          reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
-        };
-      }
+			const positions = await getMyPositionsRuntime({ force: true });
+			const openPosition = positions.positions?.find(
+				(position) => position.position === args.position_address,
+			);
+			if (!openPosition) {
+				return {
+					pass: false,
+					reason: `Position ${args.position_address} is not currently open.`,
+				};
+			}
 
-      return { pass: true };
-    }
+			return { pass: true };
+		}
 
-    case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
-      return { pass: true };
-    }
-
-    case "rebalance_on_exit":
-    case "auto_compound_fees": {
-      const portfolioGuard = evaluatePortfolioGuard();
-      if (portfolioGuard.blocked) {
-        return {
-          pass: false,
-          reason: `Portfolio guard active: ${portfolioGuard.reason}`,
-        };
-      }
-
-      if (!args?.position_address) {
-        return {
-          pass: false,
-          reason: "position_address is required.",
-        };
-      }
-      return { pass: true };
-    }
-
-    case "claim_fees":
-    case "close_position": {
-      if (!args?.position_address) {
-        return {
-          pass: false,
-          reason: "position_address is required.",
-        };
-      }
-
-      const positions = await getMyPositionsRuntime({ force: true });
-      const openPosition = positions.positions?.find((position) => position.position === args.position_address);
-      if (!openPosition) {
-        return {
-          pass: false,
-          reason: `Position ${args.position_address} is not currently open.`,
-        };
-      }
-
-      return { pass: true };
-    }
-
-    default:
-      return { pass: true };
-  }
+		default:
+			return { pass: true };
+	}
 }
 
 /**
  * Summarize a result for logging (truncate large responses).
  */
 function summarizeResult(result) {
-  const str = JSON.stringify(result);
-  if (str.length > 1000) {
-    return str.slice(0, 1000) + "...(truncated)";
-  }
-  return result;
+	const str = JSON.stringify(result);
+	if (str.length > 1000) {
+		return `${str.slice(0, 1000)}...(truncated)`;
+	}
+	return result;
 }

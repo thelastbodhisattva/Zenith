@@ -23,11 +23,15 @@ test("executor journals intent and completion for write tools", async () => {
     setActionJournalPathForTests(journalPath);
     setAutonomousWriteSuppression({ suppressed: false });
 
+    let receivedArgs = null;
     setExecutorTestOverrides({
       getMyPositions: async () => ({ total_positions: 0, positions: [] }),
       getWalletBalances: async () => ({ sol: 10, sol_price: 100, tokens: [] }),
       tools: {
-        deploy_position: async () => ({ success: true, position: "pos-1", pool: "pool-1" }),
+        deploy_position: async (args) => {
+          receivedArgs = args;
+          return { success: true, position: "pos-1", pool: "pool-1" };
+        },
       },
       recordToolOutcome: () => {},
     });
@@ -47,6 +51,9 @@ test("executor journals intent and completion for write tools", async () => {
     assert.equal(journal.entries[1].lifecycle, "completed");
     assert.equal(journal.entries[0].workflow_id, "cycle-1:deploy_position:1");
     assert.equal(journal.entries[1].workflow_id, "cycle-1:deploy_position:1");
+    assert.equal(receivedArgs.decision_context.cycle_id, "cycle-1");
+    assert.equal(receivedArgs.decision_context.action_id, "cycle-1:deploy_position:1");
+    assert.equal(receivedArgs.decision_context.workflow_id, "cycle-1:deploy_position:1");
 
     const folded = foldActionJournal(journal.entries);
     assert.equal(folded.length, 1);

@@ -1,7 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { classifyInstructionRuntimeGate, classifyManagementModelGate, deriveExpectedVolumeProfile, isPnlSignalStale, MANAGEMENT_SUBREASONS, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
+import {
+  classifyInstructionRuntimeGate,
+  classifyManagementModelGate,
+  deriveExpectedVolumeProfile,
+  evaluateDeployAdmission,
+  evaluateExposureAdmission,
+  evaluateScreeningCycleAdmission,
+  evaluateTrackedPositionExit,
+  isPnlSignalStale,
+  MANAGEMENT_SUBREASONS,
+  planManagementRuntimeAction,
+  resolveTargetManagementInterval,
+} from "./runtime-policy.js";
 
 const config = {
   management: {
@@ -162,4 +174,106 @@ test("planManagementRuntimeAction deterministically closes when a parsed instruc
   assert.equal(result.toolName, "close_position");
   assert.equal(result.rule, MANAGEMENT_SUBREASONS.INSTRUCTION);
   assert.equal(result.args.position_address, "pos-inst-close");
+});
+
+test("evaluateTrackedPositionExit owns stop-loss and trailing-take-profit rules", () => {
+  const stopLoss = evaluateTrackedPositionExit({
+    positionState: { peak_pnl_pct: 0, trailing_active: false },
+    currentPnlPct: -11,
+    managementConfig: {
+      stopLossPct: -10,
+      trailingTakeProfit: true,
+      trailingTriggerPct: 5,
+      trailingDropPct: 3,
+    },
+  });
+  assert.equal(stopLoss.action, "STOP_LOSS: PnL -11.0% hit stop loss (-10%)");
+
+  const activation = evaluateTrackedPositionExit({
+    positionState: { peak_pnl_pct: 2, trailing_active: false },
+    currentPnlPct: 6,
+    managementConfig: {
+      trailingTakeProfit: true,
+      trailingTriggerPct: 5,
+      trailingDropPct: 3,
+    },
+  });
+  assert.equal(activation.action, null);
+  assert.equal(activation.trailing_active, true);
+  assert.equal(activation.peak_pnl_pct, 6);
+  assert.match(activation.notes[0], /Trailing TP activated/i);
+
+  const trailingClose = evaluateTrackedPositionExit({
+    positionState: { peak_pnl_pct: 8, trailing_active: true },
+    currentPnlPct: 4.5,
+    managementConfig: {
+      trailingTakeProfit: true,
+      trailingTriggerPct: 5,
+      trailingDropPct: 3,
+    },
+  });
+  assert.match(trailingClose.action, /TRAILING_TP/i);
+});
+
+test("evaluateScreeningCycleAdmission preserves screening gate order", () => {
+  assert.equal(evaluateScreeningCycleAdmission({
+    positionsCount: 3,
+    walletSol: 100,
+    config: {
+      risk: { maxPositions: 3 },
+      management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+    },
+  }).status, "skipped_max_positions");
+
+  assert.equal(evaluateScreeningCycleAdmission({
+    positionsCount: 0,
+    walletSol: 0.55,
+    config: {
+      risk: { maxPositions: 3 },
+      management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+    },
+  }).status, "skipped_insufficient_balance");
+
+  assert.equal(evaluateScreeningCycleAdmission({
+    positionsCount: 0,
+    walletSol: 10,
+    config: {
+      risk: { maxPositions: 3 },
+      management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+    },
+    portfolioGuard: {
+      blocked: true,
+      reason_code: "STOP_LOSS_STREAK",
+      reason: "recent stop-loss streak 3 >= 3",
+      pause_until: "2030-01-01T00:00:00.000Z",
+    },
+  }).status, "skipped_guard_pause");
+});
+
+test("deploy governance helpers centralize exposure and live deploy checks", () => {
+  const exposure = evaluateExposureAdmission({
+    poolAddress: "pool-1",
+    baseMint: "mint-a",
+    occupiedPools: new Set(["pool-1"]),
+    occupiedMints: new Set(["mint-a"]),
+  });
+  assert.equal(exposure.pass, false);
+  assert.equal(exposure.hard_block, "pool_already_open");
+
+  const deployAdmission = evaluateDeployAdmission({
+    config: {
+      screening: { minBinStep: 80, maxBinStep: 125 },
+      management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+      risk: { maxPositions: 3, maxDeployAmount: 50 },
+    },
+    poolAddress: "pool-2",
+    baseMint: "mint-a",
+    amountY: 0.5,
+    amountX: 0,
+    binStep: 100,
+    positions: [{ pool: "pool-1", base_mint: "mint-a" }],
+    walletSol: 10,
+  });
+  assert.equal(deployAdmission.pass, false);
+  assert.match(deployAdmission.message, /already holding base token/i);
 });

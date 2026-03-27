@@ -144,6 +144,9 @@ export async function recordPerformance(perf) {
     pnl_usd: entry.pnl_usd,
     close_reason: perf.close_reason,
     closed_at: entry.recorded_at,
+    decision_cycle_id: perf.opened_by_cycle_id || null,
+    decision_action_id: perf.opened_by_action_id || null,
+    decision_workflow_id: perf.opened_by_workflow_id || null,
   });
 
   // Mirror generalized strategy outcomes into fuzzy memory.

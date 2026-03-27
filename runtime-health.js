@@ -80,10 +80,10 @@ export function formatRuntimeHealthReport(health = getRuntimeHealth()) {
     lines.push(`  portfolio_guard: ${health.portfolio_guard.active ? "active" : "clear"}${health.portfolio_guard.reason ? ` / ${health.portfolio_guard.reason}` : ""}`);
   }
   if (health.general_write_arm) {
-    lines.push(`  general_write_arm: ${health.general_write_arm.armed ? "armed" : "disarmed"}${health.general_write_arm.armed_until ? ` / ${health.general_write_arm.armed_until}` : ""}`);
+    lines.push(`  general_write_arm: ${health.general_write_arm.armed ? "armed" : "disarmed"}${health.general_write_arm.armed_until ? ` / ${health.general_write_arm.armed_until}` : ""}${health.general_write_arm.reason ? ` / ${health.general_write_arm.reason}` : ""}`);
   }
   if (health.recovery_resume_override) {
-    lines.push(`  recovery_resume_override: ${health.recovery_resume_override.active ? "active" : "inactive"}${health.recovery_resume_override.override_until ? ` / ${health.recovery_resume_override.override_until}` : ""}`);
+    lines.push(`  recovery_resume_override: ${health.recovery_resume_override.active ? "active" : "inactive"}${health.recovery_resume_override.override_until ? ` / ${health.recovery_resume_override.override_until}` : ""}${health.recovery_resume_override.source ? ` / ${health.recovery_resume_override.source}` : ""}${health.recovery_resume_override.reason ? ` / ${health.recovery_resume_override.reason}` : ""}`);
   }
 
   const providers = Object.entries(health.provider_health || {});

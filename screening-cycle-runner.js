@@ -24,6 +24,7 @@ export function createScreeningCycleRunner(deps) {
       roundMetric,
       agentLoop,
       evaluatePortfolioGuard,
+      evaluateScreeningCycleAdmission,
       getPerformanceSummary,
       classifyRuntimeRegime,
       applyRegimeHysteresis,
@@ -91,62 +92,35 @@ export function createScreeningCycleRunner(deps) {
         return;
       }
 
-      if (prePositions.total_positions >= config.risk.maxPositions) {
-        log("cron", `Screening skipped - max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
-        recordCycleEvaluation({
-          cycle_id: cycleId,
-          cycle_type: "screening",
-          status: "skipped_max_positions",
-          summary: {
-            total_positions: prePositions.total_positions,
-            max_positions: config.risk.maxPositions,
-          },
-          candidates: [],
-        });
-        return;
-      }
-
-      const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-      if (preBalance.sol < minRequired) {
-        log("cron", `Screening skipped - insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-        recordCycleEvaluation({
-          cycle_id: cycleId,
-          cycle_type: "screening",
-          status: "skipped_insufficient_balance",
-          summary: {
-            wallet_sol: roundMetric(preBalance.sol),
-            min_required_sol: roundMetric(minRequired),
-          },
-          candidates: [],
-        });
-        return;
-      }
-
       const portfolioGuard = evaluatePortfolioGuard({
         portfolioSnapshot: preBalance,
       });
-      if (portfolioGuard.blocked) {
-        log("cron", `Screening paused by portfolio guard: ${portfolioGuard.reason}`);
+      const screeningAdmission = evaluateScreeningCycleAdmission({
+        positionsCount: prePositions.total_positions,
+        walletSol: preBalance.sol,
+        config,
+        portfolioGuard,
+      });
+      if (!screeningAdmission.allowed) {
+        log("cron", screeningAdmission.log_message);
         recordCycleEvaluation({
           cycle_id: cycleId,
           cycle_type: "screening",
-          status: "skipped_guard_pause",
-          summary: {
-            reason_code: portfolioGuard.reason_code,
-            reason: portfolioGuard.reason,
-            pause_until: portfolioGuard.pause_until,
-          },
+          status: screeningAdmission.status,
+          summary: screeningAdmission.summary,
           candidates: [],
         });
-        refreshRuntimeHealth({
-          cycles: {
-            screening: {
-              status: "skipped_guard_pause",
-              reason: portfolioGuard.reason,
-              at: new Date().toISOString(),
+        if (screeningAdmission.status === "skipped_guard_pause") {
+          refreshRuntimeHealth({
+            cycles: {
+              screening: {
+                status: screeningAdmission.status,
+                reason: screeningAdmission.reason,
+                at: new Date().toISOString(),
+              },
             },
-          },
-        });
+          });
+        }
         return;
       }
 
@@ -472,7 +446,13 @@ STEPS:
 2. Reuse the pre-loaded LP-wallet scoring and planner context in your reasoning.
 3. deploy_position directly.
 4. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096);
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096, {
+        toolContext: {
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          regime_label: regimeContext.regime,
+        },
+      });
 
       screenReport = content;
       screeningEvaluation = {
@@ -498,6 +478,19 @@ STEPS:
           },
         candidates: candidateEvaluations,
       };
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        occupied_pools: screeningTopCandidates?.occupied_pools || [],
+        occupied_mints: screeningTopCandidates?.occupied_mints || [],
+        candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
+        shortlist: shortlist.map((pool) => ({
+          pool: pool.pool,
+          name: pool.name,
+          ranking_score: pool.deterministic_score,
+        })),
+        total_eligible: totalEligible,
+      });
     } catch (error) {
       log("cron_error", `Screening cycle failed: ${error.message}`);
       screenReport = `Screening cycle failed: ${error.message}`;

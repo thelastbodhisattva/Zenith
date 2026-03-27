@@ -6,6 +6,12 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-27
 
+- Centralized live governance into shared runtime-policy helpers so tracked-position exits, screening skip checks, deploy admission, and exposure guards now reuse one canonical decision surface.
+- Threaded persistent `cycle_id` / `action_id` / `workflow_id` lineage through executor dispatch, tracked-position state, realized performance records, replay envelopes, and counterfactual outcome attachment.
+- Persisted success-path replay envelopes for screening and management cycles so deterministic replay/reconciliation no longer depends only on fail-closed or failed runs.
+- Normalized operator arming and recovery-resume reads behind one persisted operator-control snapshot, then reused that snapshot across command handlers, runtime health, REPL, and Telegram flows.
+- Narrowed execution/orchestration boundaries by extracting executor decision-context and lifecycle helpers while keeping DLMM close-performance packaging adapter-owned.
+- Updated README and changelog documentation to reflect the four-phase governance, lineage, operator, and boundary-hardening pass.
 - Added a bounded adaptation layer with `regime-packs.js`, `negative-regime-memory.js`, and `counterfactual-review.js`, plus rollout-based threshold evolution in `lessons.js`.
 - Screening now applies fixed regime-conditioned parameter packs deterministically and uses adaptive deploy sizing under hard reserve/floor/cap rules.
 - Threshold evolution now records rollout metadata and can auto-rollback degraded screening changes instead of ratcheting them permanently.

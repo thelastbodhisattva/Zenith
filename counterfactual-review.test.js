@@ -22,17 +22,25 @@ test("appendCounterfactualReview persists observational records only", async () 
         { regime: "offensive", selected_pool: "pool-a", diverged_from_active: false },
       ],
     });
+    appendCounterfactualReview({
+      cycle_id: "screening-456",
+      active_regime: "neutral",
+      active_selected_pool: "pool-a",
+      alternates: [
+        { regime: "defensive", selected_pool: "pool-c", diverged_from_active: true },
+      ],
+    });
 
     const lines = fs.readFileSync(filePath, "utf8").trim().split("\n");
-    assert.equal(lines.length, 1);
+    assert.equal(lines.length, 2);
     const parsed = JSON.parse(lines[0]);
     assert.equal(parsed.cycle_id, "screening-123");
     assert.equal(parsed.active_regime, "neutral");
     assert.equal(parsed.alternates.length, 2);
 
     const summary = getCounterfactualReviewSummary(5);
-    assert.equal(summary.total_reviews, 1);
-    assert.equal(summary.total_alternates, 2);
+    assert.equal(summary.total_reviews, 2);
+    assert.equal(summary.total_alternates, 3);
 
     const attached = attachCounterfactualRealizedOutcome({
       pool_address: "pool-a",
@@ -40,13 +48,16 @@ test("appendCounterfactualReview persists observational records only", async () 
       pnl_pct: -6.5,
       pnl_usd: -18,
       close_reason: "stop loss",
+      decision_cycle_id: "screening-123",
     });
     assert.equal(attached.updated, true);
+    assert.equal(attached.cycle_id, "screening-123");
 
     const resolved = getCounterfactualReviewSummary(5);
     assert.equal(resolved.resolved_reviews, 1);
     assert.equal(resolved.divergent_resolved_losses, 1);
-    assert.equal(resolved.recent_reviews[0].realized_outcome.usefulness_hint, "review_divergent_alternates");
+    const matchingReview = resolved.recent_reviews.find((review) => review.cycle_id === "screening-123");
+    assert.equal(matchingReview.realized_outcome.usefulness_hint, "review_divergent_alternates");
   } finally {
     if (originalPath) process.env.ZENITH_COUNTERFACTUAL_REVIEW_FILE = originalPath;
     else delete process.env.ZENITH_COUNTERFACTUAL_REVIEW_FILE;

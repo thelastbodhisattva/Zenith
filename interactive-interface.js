@@ -1,6 +1,6 @@
-import readline from "readline";
+import readline from "node:readline";
 
-import { formatCandidates, formatCandidateInspection, formatRangeStatus, inspectCandidate } from "./screening-intel.js";
+import { formatCandidateInspection, formatCandidates, formatRangeStatus, inspectCandidate } from "./screening-intel.js";
 import { formatInteractiveHelp, renderInteractiveStartup } from "./startup-interface.js";
 
 export async function runInteractiveInterface({
@@ -34,7 +34,7 @@ export async function runInteractiveInterface({
   log,
   agentLoop,
   config,
-  getGeneralWriteArmStatus,
+  getOperatorControlSnapshot,
   startPolling,
   sendMessage,
   sendHTML,
@@ -192,6 +192,7 @@ export async function runInteractiveInterface({
           buildStaticProviderHealth,
           buildProviderHealthFromSnapshot,
           refreshRuntimeHealth,
+          getOperatorControlSnapshot,
           secretHealth,
           telegramEnabled,
         }));
@@ -212,6 +213,7 @@ export async function runInteractiveInterface({
       acknowledgeRecoveryResume,
       armGeneralWriteTools,
       disarmGeneralWriteTools,
+      getOperatorControlSnapshot,
       refreshRuntimeHealth,
     });
     if (operatorCommand.handled) {
@@ -226,7 +228,7 @@ export async function runInteractiveInterface({
       const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
       const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
       const { content } = await agentLoop(text, config.llm.maxSteps, state.sessionHistory, agentRole, config.llm.generalModel, null, {
-        allowDangerousTools: agentRole !== "GENERAL" || getGeneralWriteArmStatus().armed,
+        allowDangerousTools: agentRole !== "GENERAL" || getOperatorControlSnapshot().general_write_arm.armed,
       });
       appendHistory(text, content);
       await sendMessage(content);
@@ -302,6 +304,7 @@ export async function runInteractiveInterface({
           buildStaticProviderHealth,
           buildProviderHealthFromSnapshot,
           refreshRuntimeHealth,
+          getOperatorControlSnapshot,
           secretHealth,
           telegramEnabled,
         }));
@@ -507,6 +510,7 @@ export async function runInteractiveInterface({
           acknowledgeRecoveryResume,
           armGeneralWriteTools,
           disarmGeneralWriteTools,
+          getOperatorControlSnapshot,
           refreshRuntimeHealth,
         });
         if (operatorCommand.handled) {
@@ -682,7 +686,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
     await runBusy(async () => {
       log("user", input);
       const { content } = await agentLoop(input, config.llm.maxSteps, state.sessionHistory, "GENERAL", config.llm.generalModel, null, {
-        allowDangerousTools: getGeneralWriteArmStatus().armed,
+        allowDangerousTools: getOperatorControlSnapshot().general_write_arm.armed,
       });
       appendHistory(input, content);
       console.log(`\n${content}\n`);

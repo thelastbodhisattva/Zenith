@@ -48,6 +48,23 @@ export function createManagementCycleRunner(deps) {
     let positions = [];
     let walletSnapshot = null;
     let triggerFollowOnScreening = false;
+    let positionData = [];
+    let runtimeActions = [];
+
+    const appendManagementReplayEnvelope = (inputs, actions) => {
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "management",
+        position_inputs: inputs,
+        runtime_actions: actions.map((action) => ({
+          position: action.position,
+          tool: action.toolName,
+          rule: action.rule,
+          reason: action.reason,
+          action_id: action.actionId,
+        })),
+      });
+    };
 
     try {
       const [livePositionsResult, walletSnapshotResult] = await Promise.all([
@@ -108,6 +125,7 @@ export function createManagementCycleRunner(deps) {
           },
           positions: [],
         };
+        appendManagementReplayEnvelope([], []);
         triggerFollowOnScreening = shouldTriggerFollowOnScreening({
           positionsCount: positions.length,
           screeningBusy: getScreeningBusy(),
@@ -117,7 +135,7 @@ export function createManagementCycleRunner(deps) {
         return;
       }
 
-      const positionData = await Promise.all(positions.map(async (p) => {
+      positionData = await Promise.all(positions.map(async (p) => {
         recordPositionSnapshot(p.pool, p);
         const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch(() => null);
         const recall = recallForPool(p.pool);
@@ -143,7 +161,7 @@ export function createManagementCycleRunner(deps) {
         openPositionPnls: positionData.map((position) => position.pnl).filter(Boolean),
       });
 
-      const runtimeActions = await runManagementRuntimeActions(positionData, {
+      runtimeActions = await runManagementRuntimeActions(positionData, {
         cycleId,
         config,
         executeTool,
@@ -204,6 +222,7 @@ export function createManagementCycleRunner(deps) {
             exit_alert: p.exitAlert || null,
           })),
         };
+        appendManagementReplayEnvelope(positionData, runtimeActions);
         return;
       }
 
@@ -231,6 +250,7 @@ export function createManagementCycleRunner(deps) {
             runtime_attempted: attemptedRuntimeActionMap.has(p.position),
           })),
         };
+        appendManagementReplayEnvelope(positionData, runtimeActions);
         return;
       }
 
@@ -264,7 +284,12 @@ If all positions STAY and no fees to claim, just write the report with no tool c
 REPORT FORMAT (one per position):
 **[PAIR]** | Age: [X]m | Unclaimed: $[X] | Claimed: $[X] | PnL: [X]%
 **Instruction:** [met / not met] | **Decision:** STAY/CLOSE | **Reason:** [1 sentence]
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096);
+      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096, {
+        toolContext: {
+          cycle_id: cycleId,
+          cycle_type: "management",
+        },
+      });
       mgmtReport = runtimeActions.length > 0
         ? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\n${content}`
         : content;
@@ -282,16 +307,17 @@ REPORT FORMAT (one per position):
           enforced_management_interval_min: intervalAdjustment.interval,
           max_open_position_volatility: intervalAdjustment.maxVolatility,
         },
-        positions: pendingPositionData.slice(0, 8).map((p) => ({
-          pair: p.pair,
-          position: p.position,
+          positions: pendingPositionData.slice(0, 8).map((p) => ({
+            pair: p.pair,
+            position: p.position,
           in_range: p.in_range,
           out_of_range_direction: p.out_of_range_direction || null,
           unclaimed_fee_usd: roundMetric(p.pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd),
           exit_alert: p.exitAlert || null,
-          memory_hits: p.memoryRecall ? 1 : 0,
-        })),
-      };
+            memory_hits: p.memoryRecall ? 1 : 0,
+          })),
+        };
+      appendManagementReplayEnvelope(positionData, runtimeActions);
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;

@@ -16,6 +16,7 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { getNegativeRegimeCooldown, recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { initMemory, recallForManagement } from "./memory.js";
 import { classifyManagementModelGate, deriveExpectedVolumeProfile, isPnlSignalStale, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { evaluateScreeningCycleAdmission } from "./runtime-policy.js";
 import { getLpOverview } from "./tools/lp-overview.js";
 import { appendReplayEnvelope, createCycleId } from "./cycle-trace.js";
 import { classifyRuntimeFailure, isFailClosedResult, validateStartupSnapshot } from "./degraded-mode.js";
@@ -26,7 +27,7 @@ import { getEvidenceBundle } from "./evidence-bundles.js";
 import { getRecoveryWorkflowReport, runBootRecovery, summarizeRecoveryBlock } from "./boot-recovery.js";
 import { getOverlappingCycleType, shouldTriggerFollowOnScreening } from "./cycle-overlap.js";
 import { clearPortfolioGuardPause, evaluatePortfolioGuard } from "./portfolio-guards.js";
-import { acknowledgeRecoveryResume, armGeneralWriteTools, disarmGeneralWriteTools, getGeneralWriteArmStatus, getRecoveryResumeOverrideStatus } from "./operator-controls.js";
+import { acknowledgeRecoveryResume, armGeneralWriteTools, disarmGeneralWriteTools, getOperatorControlSnapshot } from "./operator-controls.js";
 import { updateRuntimeHealth } from "./runtime-health.js";
 import { formatReplayReview, getReplayEnvelope, getReplayReview, getReplayReviewStats } from "./replay-review.js";
 import { listActionJournalEntries } from "./action-journal.js";
@@ -78,8 +79,7 @@ const refreshRuntimeHealth = createRuntimeHealthRefresher({
   updateRuntimeHealth,
   getAutonomousWriteSuppression,
   getRecoveryWorkflowReport,
-  getGeneralWriteArmStatus,
-  getRecoveryResumeOverrideStatus,
+  getOperatorControlSnapshot,
 });
 
 const bootRecovery = await runBootRecovery({
@@ -87,7 +87,7 @@ const bootRecovery = await runBootRecovery({
   observeTrackedPositions: () => getTrackedPositions(true),
 });
 
-const recoveryResumeOverride = getRecoveryResumeOverrideStatus();
+const recoveryResumeOverride = getOperatorControlSnapshot().recovery_resume_override;
 const bootRecoveryOverrideActive = bootRecovery.suppress_autonomous_writes
   && bootRecovery.reason_code !== "JOURNAL_INVALID"
   && recoveryResumeOverride.active;
@@ -275,6 +275,7 @@ export function startCronJobs() {
     roundMetric,
     agentLoop,
     evaluatePortfolioGuard,
+    evaluateScreeningCycleAdmission,
     getPerformanceSummary,
     classifyRuntimeRegime,
     applyRegimeHysteresis,
@@ -452,6 +453,7 @@ if (isTTY) {
     buildStaticProviderHealth,
     buildProviderHealthFromSnapshot,
     refreshRuntimeHealth,
+    getOperatorControlSnapshot,
     secretHealth,
     telegramEnabled,
     generateBriefing,
@@ -467,7 +469,6 @@ if (isTTY) {
     log,
     agentLoop,
     config,
-    getGeneralWriteArmStatus,
     startPolling,
     sendMessage,
     sendHTML,

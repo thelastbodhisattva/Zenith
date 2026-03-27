@@ -15,6 +15,10 @@ test("operator command handler blocks resume on journal invalid", async () => {
     acknowledgeRecoveryResume: () => ({ override_until: null }),
     armGeneralWriteTools: () => ({ armed_until: null }),
     disarmGeneralWriteTools: () => ({ armed: false }),
+    getOperatorControlSnapshot: () => ({
+      general_write_arm: { armed: false, armed_until: null },
+      recovery_resume_override: { active: false, override_until: null },
+    }),
     refreshRuntimeHealth: () => {},
   });
 
@@ -34,6 +38,10 @@ test("operator command handler arms writes and reports window", async () => {
     acknowledgeRecoveryResume: () => ({ override_until: null }),
     armGeneralWriteTools: ({ minutes }) => ({ armed_until: `until+${minutes}` }),
     disarmGeneralWriteTools: () => ({ armed: false }),
+    getOperatorControlSnapshot: () => ({
+      general_write_arm: { armed: true, armed_until: "until+7" },
+      recovery_resume_override: { active: false, override_until: null },
+    }),
     refreshRuntimeHealth: () => {},
   });
 

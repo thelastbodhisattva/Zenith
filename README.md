@@ -33,6 +33,10 @@ Two specialized agents run on independent schedules:
 A third health check runs hourly to summarize portfolio state.
 
 **Current runtime behavior:**
+- Live governance now routes through shared runtime policy helpers: screening skip logic, deploy admission, exposure checks, and tracked-position exit rules no longer each own separate decision math
+- Deploy and close actions now preserve `cycle_id`, `action_id`, and `workflow_id` through executor dispatch, tracked-position state, realized performance rows, replay envelopes, and counterfactual resolution
+- Screening and management success paths now persist replay envelopes as well as failure paths, so deterministic review no longer depends only on degraded-cycle evidence
+- Operator arming and recovery-resume state now read from one persisted snapshot across REPL, Telegram, runtime health, and control-plane reporting
 - Screening cycles now use a staged funnel: cheap deterministic ranking across a wider candidate set, a visible ranked shortlist, and deep enrichment only for top finalists instead of enriching every candidate equally
 - Management cycles now resolve obvious runtime actions first (stop-loss closes, take-profit closes, low-yield closes, fee-threshold handling, and out-of-range rebalances) and leave the LLM mainly with instruction-bound edge cases
 - Management cadence is runtime-owned and auto-adjusts from the most volatile open position: `>= 5 -> 3m`, `>= 2 -> 5m`, otherwise `10m`
@@ -53,6 +57,7 @@ A third health check runs hourly to summarize portfolio state.
 - Bad-cycle evidence bundles are now persisted for fail-closed and failed screening/management cycles, and `/failures` exposes the latest bundle summaries directly in the REPL
 - `/proof` now surfaces a bounded strategy-proof summary from realized closes: inventory contribution, fee contribution, operational touch count, per-strategy breakdown, and dominant close reasons
 - Runtime writes now flow through a durable action journal in `data/workflow-actions.jsonl`, with executor-boundary `intent -> terminal` lifecycle tracking and rebalance-specific mid-state handoff for restart safety
+- `tools/executor.js` now stays focused on decision-context attachment, write lifecycle journaling, safety enforcement, and post-tool side effects, while adapter-specific close/deploy accounting stays in `tools/dlmm.js`
 - Boot recovery now resolves prior write workflows observation-first, blocks autonomous writes on journal corruption or unresolved outcomes, and exposes `/recovery` so the operator can inspect suppression state without opening JSONL directly
 - Provider-free operator and chaos drills now cover fail-closed screening startup paths, stale-PnL management behavior, bounded LP Agent fallback, and screening replay reconciliation
 - `npm run test:hardening` now acts as the committed runtime-hardening verification gate; `npm run test:screen` remains the live external screening smoke and `npm run test:agent` remains the optional dry-run full-agent smoke

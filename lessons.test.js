@@ -42,7 +42,17 @@ test("recordPerformance exposes fee and inventory attribution", async () => {
       close_reason: "rebalance",
       claim_count: 1,
       rebalance_count: 1,
+      opened_by_cycle_id: "screening-123",
+      opened_by_action_id: "screening-123:deploy_position:1",
+      opened_by_workflow_id: "screening-123:deploy_position:1",
+      closed_by_cycle_id: "management-456",
+      closed_by_action_id: "management-456:close_position:1",
+      closed_by_workflow_id: "management-456:close_position:1",
     });
+
+    const persisted = JSON.parse(fs.readFileSync(lessonsPath, "utf8"));
+    assert.equal(persisted.performance[0].opened_by_cycle_id, "screening-123");
+    assert.equal(persisted.performance[0].closed_by_action_id, "management-456:close_position:1");
 
     const summary = getPerformanceSummary();
     assert.equal(summary.total_positions_closed, 1);

@@ -1,6 +1,6 @@
 import { formatRecoveryWorkflowReport } from "./boot-recovery.js";
-import { formatPortfolioGuardReport, getPortfolioGuardStatus } from "./portfolio-guards.js";
 import { listOperatorActions } from "./operator-controls.js";
+import { formatPortfolioGuardReport, getPortfolioGuardStatus } from "./portfolio-guards.js";
 import { formatRuntimeHealthReport } from "./runtime-health.js";
 
 export function buildStaticProviderHealth({ secretHealth, telegramEnabled }) {
@@ -58,15 +58,13 @@ export function createRuntimeHealthRefresher({
   updateRuntimeHealth,
   getAutonomousWriteSuppression,
   getRecoveryWorkflowReport,
-  getGeneralWriteArmStatus,
-  getRecoveryResumeOverrideStatus,
+  getOperatorControlSnapshot,
 } = {}) {
   return function refreshRuntimeHealth(overrides = {}) {
     const suppression = getAutonomousWriteSuppression();
     const recoveryReport = getRecoveryWorkflowReport({ limit: 5 });
     const portfolioGuard = getPortfolioGuardStatus();
-    const generalWriteArm = getGeneralWriteArmStatus();
-    const resumeOverride = getRecoveryResumeOverrideStatus();
+    const operatorControls = getOperatorControlSnapshot();
     return updateRuntimeHealth({
       recovery: {
         status: recoveryReport.status,
@@ -79,8 +77,8 @@ export function createRuntimeHealthRefresher({
         reason: portfolioGuard.reason,
         pause_until: portfolioGuard.pause_until,
       },
-      general_write_arm: generalWriteArm,
-      recovery_resume_override: resumeOverride,
+      general_write_arm: operatorControls.general_write_arm,
+      recovery_resume_override: operatorControls.recovery_resume_override,
       ...overrides,
     });
   };
@@ -138,6 +136,7 @@ export async function buildOperationalHealthReport({
   buildStaticProviderHealth,
   buildProviderHealthFromSnapshot,
   refreshRuntimeHealth,
+  getOperatorControlSnapshot,
   secretHealth,
   telegramEnabled,
 } = {}) {
@@ -173,7 +172,8 @@ export async function buildOperationalHealthReport({
         }
   );
 
-  const actionLines = listOperatorActions(3)
+  const operatorControls = getOperatorControlSnapshot ? getOperatorControlSnapshot({ recentActionLimit: 3 }) : null;
+  const actionLines = (operatorControls?.recent_actions || listOperatorActions(3))
     .map((entry) => `  - ${entry.ts}: ${entry.type}${entry.reason ? ` / ${entry.reason}` : ""}`);
 
   return [

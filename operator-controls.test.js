@@ -9,6 +9,7 @@ import {
   armGeneralWriteTools,
   disarmGeneralWriteTools,
   getGeneralWriteArmStatus,
+  getOperatorControlSnapshot,
   getRecoveryResumeOverrideStatus,
   listOperatorActions,
 } from "./operator-controls.js";
@@ -60,6 +61,11 @@ test("operator controls persist arm and resume override state across reload-styl
     assert.equal(overrideStatus.active, true);
     assert.match(overrideStatus.reason || "", /manual review complete/i);
     assert.equal(overrideStatus.source, "test");
+
+    const snapshot = getOperatorControlSnapshot({ nowMs: nowMs + 5 * 60_000, recentActionLimit: 2 });
+    assert.equal(snapshot.general_write_arm.armed, false);
+    assert.equal(snapshot.recovery_resume_override.active, true);
+    assert.equal(snapshot.recent_actions.length > 0, true);
 
     const stateRaw = JSON.parse(fs.readFileSync(path.join(tempDir, "data", "operator-state.json"), "utf8"));
     assert.equal(stateRaw.general_write_arm_reason, "persist arm");
