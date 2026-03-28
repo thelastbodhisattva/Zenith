@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-27`
+Implementation status updated: `2026-03-28`
 
 ---
 
@@ -33,6 +33,12 @@ Two specialized agents run on independent schedules:
 A third health check runs hourly to summarize portfolio state.
 
 **Current runtime behavior:**
+- `tools/dlmm.js` is now narrower: pure DLMM planning, settlement observation, live position-context enrichment, and rebalance/compounding context helpers were split into dedicated modules while keeping the public tool surface stable
+- `tools/executor.js` is now narrower too: lifecycle journaling, post-success side effects, and safety-policy evaluation live behind dedicated helpers so `executeTool()` is closer to a coordinator than a god-function
+- Direct tests now cover screening fail-closed prechecks, runtime-only management cycles, the `/preflight` shell path, and headless Telegram operator ingress instead of relying only on indirect hardening coverage
+- Operator state and evidence reads now use backup-aware tolerance, bringing `operator-controls.js` and `evidence-bundles.js` closer to the durability standard already used by `state.js` and `runtime-health.js`
+- Threshold evolution now runs through one safe live engine for both automatic and manual `/evolve`: only `minFeeActiveTvlRatio` and `minOrganic`, only realized-close data, one active rollout at a time, bounded step size, automatic rollback on degradation, fail-closed invalid-state handling, and evidence on every mutation decision
+- Threshold-rollout startup recovery now handles `apply_pending` and `rollback_pending` phases explicitly so config mutation cannot outrun persisted rollout intent/state after a crash
 - Live governance now routes through shared runtime policy helpers: screening skip logic, deploy admission, exposure checks, and tracked-position exit rules no longer each own separate decision math
 - Deploy and close actions now preserve `cycle_id`, `action_id`, and `workflow_id` through executor dispatch, tracked-position state, realized performance rows, replay envelopes, and counterfactual resolution
 - Screening and management success paths now persist replay envelopes as well as failure paths, so deterministic review no longer depends only on degraded-cycle evidence
@@ -220,8 +226,8 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/replay <cycle_id>` | Show one replay envelope |
 | `/reconcile <cycle_id>` | Re-run deterministic replay reconciliation for one cycle |
 | `/review` | Show replay-backed review stats across recent cycles |
-| `/resume <why>` | Clear current-process autonomous write suppression after manual review |
-| `/arm [minutes] [why]` | Temporarily arm GENERAL free-form write tools |
+| `/resume <why>` | Clear current-process suppression only for unresolved-workflow manual-review blocks |
+| `/arm <minutes> tool=<name>[,name] [pool=<pool>] [position=<position>] [max_sol=<n>] [once] [why]` | Temporarily arm scoped GENERAL write access |
 | `/disarm` | Remove GENERAL free-form write access |
 | `/performance` | Show recent closed-position attribution and history |
 | `/proof` | Show bounded strategy proof summary from realized closes |
@@ -230,7 +236,7 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/learn <pool_address>` | Study top LPers for one specific pool |
 | `<wallet_address>` | Inspect a wallet's positions or a pool's LP-wallet context |
 | `/thresholds` | Show current screening thresholds and closed-position performance stats |
-| `/evolve` | Trigger threshold evolution from performance data |
+| `/evolve` | Trigger the same safe live threshold-rollout engine used by automatic evolution |
 | `/stop` | Graceful shutdown |
 | `<anything else>` | Free-form chat for questions, actions, and pool analysis |
 
@@ -244,9 +250,9 @@ Free-form chat keeps recent session history so you can continue the conversation
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) and copy the token
 2. Add `TELEGRAM_BOT_TOKEN=<token>` to your `.env`
-3. Start the agent, then send any message to the bot
+3. Configure `TELEGRAM_CHAT_ID=<your_chat_id>` in `.env` or `telegramChatId` in `user-config.json`
 
-On first message, Zenith auto-registers your chat ID and starts sending notifications.
+Zenith does not auto-register the first sender anymore. If no chat ID is configured, Telegram polling stays disabled.
 
 **Notifications include:**
 - Management-cycle reports
@@ -255,7 +261,7 @@ On first message, Zenith auto-registers your chat ID and starts sending notifica
 - Deploy confirmations
 - Close confirmations and realized PnL context
 
-Telegram uses the same free-form agent interface as the REPL.
+Interactive mode Telegram uses the same free-form agent interface as the REPL. Headless/non-TTY mode accepts `/health`, `/recovery`, and operator commands over Telegram, but does not expose the full free-form chat shell.
 
 ---
 
@@ -281,9 +287,14 @@ Strategy memory no longer depends only on exact `strategy + bin step` pairings. 
 
 Threshold evolution is now bounded as a rollout instead of a blind overwrite:
 
-- Zenith stores the previous and new threshold values in `threshold-rollout.json`
+- Zenith only mutates `minFeeActiveTvlRatio` and `minOrganic`
+- evolution is based only on realized-close data
+- Zenith stores previous values, new values, rollout phase, and baseline metrics in `threshold-rollout.json`
+- only one active rollout can exist at a time
 - after the minimum number of subsequent closes, Zenith either accepts the rollout or rolls it back automatically if post-change performance degrades
-- this keeps evolution online and autonomous without letting one bad step permanently distort screening
+- unreadable lessons / rollout / config state now blocks evolution fail-closed instead of mutating through corruption
+- every start / accept / rollback / blocked decision writes an evidence bundle with rollout id, old/new values, metrics, reason code, and runbook slug
+- this keeps evolution online and autonomous without letting one bad step permanently distort screening or outrun persisted state
 
 Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, and compact counters such as candidates scored, candidates blocked, runtime actions handled, and write-tool blocks/errors. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
 

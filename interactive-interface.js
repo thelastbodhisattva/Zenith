@@ -1,10 +1,134 @@
 import readline from "node:readline";
 
+import {
+	evaluateGeneralWriteApproval,
+	recordOperatorAction,
+} from "./operator-controls.js";
+import { buildRiskOpeningPreflightReport, formatPreflightReport } from "./preflight.js";
 import { formatCandidateInspection, formatCandidates, formatRangeStatus, inspectCandidate } from "./screening-intel.js";
 import { formatInteractiveHelp, renderInteractiveStartup } from "./startup-interface.js";
 
 export function getTelegramFreeformAgentRole() {
 	return "GENERAL";
+}
+
+export async function runThresholdEvolutionCommand({
+	getPerformanceSummary,
+	evolveThresholds,
+	reloadScreeningThresholds,
+	config,
+	recordAction = recordOperatorAction,
+} = {}) {
+	const perf = getPerformanceSummary();
+	recordAction({ type: "evolve_thresholds_requested", total_positions_closed: perf?.total_positions_closed || 0 });
+	const result = evolveThresholds(null, config, { trigger: "manual" });
+	if (result?.rollout?.status === "blocked_invalid_state") {
+		recordAction({
+			type: "evolve_thresholds_blocked",
+			reason_code: result.rollout.reason_code,
+			error: result.rollout.error || null,
+		});
+		return {
+			status: "blocked",
+			message: `Cannot evolve thresholds: ${result.rollout.error || result.rollout.reason_code}`,
+			result,
+		};
+	}
+	if (result?.rollout?.status === "insufficient_history") {
+		recordAction({
+			type: "evolve_thresholds_insufficient_history",
+			total_positions_closed: result.rollout.total_positions_closed,
+		});
+		const needed = (result.rollout.min_positions_required || 5) - (result.rollout.total_positions_closed || 0);
+		return {
+			status: "insufficient_history",
+			message: `Need at least 5 closed positions to evolve. ${needed} more needed.`,
+			result,
+		};
+	}
+	if (!result || (Object.keys(result.changes).length === 0 && result.rollout?.status !== "rolled_back")) {
+		recordAction({
+			type: "evolve_thresholds_noop",
+			rollout_status: result?.rollout?.status || null,
+			total_positions_closed: perf.total_positions_closed,
+		});
+		return {
+			status: "noop",
+			message: "No threshold changes needed — current settings already match performance data.",
+			result,
+		};
+	}
+
+	if (result.requires_reload || (result.changes && Object.keys(result.changes).length > 0)) {
+		reloadScreeningThresholds();
+	}
+	recordAction({
+		type: "evolve_thresholds_applied",
+		changed_keys: Object.keys(result.changes),
+		rollout_status: result.rollout?.status || null,
+		rollout_id: result.rollout?.rollout_id || null,
+	});
+	return {
+		status: "applied",
+		message: "Thresholds evolved and applied immediately.",
+		result,
+	};
+}
+
+export async function runPreflightCheckCommand({
+	rawInput = "",
+	deployAmountSol,
+	getStartupSnapshot,
+	getWalletBalances,
+	getMyPositions,
+	getTopCandidates,
+	buildRiskOpeningPreflightReport,
+	isFailClosedResult,
+	getRecoveryWorkflowReport,
+	getAutonomousWriteSuppression,
+	config,
+	refreshRuntimeHealth,
+	evaluateApproval = evaluateGeneralWriteApproval,
+} = {}) {
+	const rawArgs = rawInput.split(/\s+/).filter(Boolean);
+	const options = Object.fromEntries(
+		rawArgs
+			.filter((part) => part.includes("="))
+			.map((part) => {
+				const [key, ...valueParts] = part.split("=");
+				return [key, valueParts.join("=")];
+			}),
+	);
+	const toolName = options.tool || "deploy_position";
+	const poolAddress = options.pool || null;
+	const positionAddress = options.position || null;
+	const amountSol = Number(options.amount_sol ?? options.max_sol ?? deployAmountSol);
+	const startupSnapshot = await getStartupSnapshot({
+		force: true,
+		getWalletBalances,
+		getMyPositions,
+		getTopCandidates,
+	});
+	const approval = evaluateApproval({
+		tool_name: toolName,
+		pool_address: poolAddress,
+		position_address: positionAddress,
+		amount_sol: amountSol,
+	});
+	const report = buildRiskOpeningPreflightReport({
+		tool_name: toolName,
+		pool_address: poolAddress,
+		position_address: positionAddress,
+		amount_sol: amountSol,
+		startupSnapshot,
+		isFailClosedResult,
+		recoveryReport: getRecoveryWorkflowReport({ limit: 10 }),
+		suppression: getAutonomousWriteSuppression(),
+		approval,
+		config,
+	});
+	refreshRuntimeHealth({ preflight: report });
+	return report;
 }
 
 export async function runInteractiveInterface({
@@ -206,6 +330,33 @@ export async function runInteractiveInterface({
       return;
     }
 
+			const telegramPreflight = text.match(/^\/preflight(?:\s+(.*))?$/i);
+			if (telegramPreflight) {
+				try {
+					await sendMessage(
+						formatPreflightReport(
+							await runPreflightCheckCommand({
+								rawInput: telegramPreflight[1] || "",
+								deployAmountSol,
+								getStartupSnapshot,
+								getWalletBalances,
+								getMyPositions,
+								getTopCandidates,
+								buildRiskOpeningPreflightReport,
+								isFailClosedResult,
+								getRecoveryWorkflowReport,
+								getAutonomousWriteSuppression,
+								config,
+								refreshRuntimeHealth,
+							}),
+						),
+					).catch(() => {});
+				} catch (e) {
+					await sendMessage(`Error: ${e.message}`).catch(() => {});
+				}
+				return;
+			}
+
     const operatorCommand = await handleOperatorCommandText({
       text,
       source: "telegram",
@@ -229,8 +380,10 @@ export async function runInteractiveInterface({
     try {
       log("telegram", `Incoming: ${text}`);
 			const agentRole = getTelegramFreeformAgentRole();
+			const armStatus = getOperatorControlSnapshot().general_write_arm;
       const { content } = await agentLoop(text, config.llm.maxSteps, state.sessionHistory, agentRole, config.llm.generalModel, null, {
-        allowDangerousTools: agentRole !== "GENERAL" || getOperatorControlSnapshot().general_write_arm.armed,
+				allowDangerousTools: agentRole !== "GENERAL" || armStatus.armed,
+				dangerousToolScope: agentRole === "GENERAL" ? armStatus.scope : null,
       });
       appendHistory(text, content);
       await sendMessage(content);
@@ -313,6 +466,31 @@ export async function runInteractiveInterface({
       });
       return;
     }
+
+		const preflightMatch = input.match(/^\/preflight(?:\s+(.*))?$/i);
+		if (preflightMatch) {
+			await runBusy(async () => {
+				console.log(
+					formatPreflightReport(
+						await runPreflightCheckCommand({
+							rawInput: preflightMatch[1] || "",
+							deployAmountSol,
+							getStartupSnapshot,
+							getWalletBalances,
+							getMyPositions,
+							getTopCandidates,
+							buildRiskOpeningPreflightReport,
+							isFailClosedResult,
+							getRecoveryWorkflowReport,
+							getAutonomousWriteSuppression,
+							config,
+							refreshRuntimeHealth,
+						}),
+					),
+				);
+			});
+			return;
+		}
 
     if (input === "/status") {
       await runBusy(async () => {
@@ -410,7 +588,7 @@ export async function runInteractiveInterface({
         }
         console.log("\nRecent bad-cycle evidence bundles:\n");
         for (const bundle of bundles) {
-          console.log(`  - ${bundle.file}: ${bundle.cycle_type} / ${bundle.status}${bundle.reason_code ? ` / ${bundle.reason_code}` : ""}${bundle.error ? ` / ${bundle.error}` : ""}`);
+				console.log(`  - ${bundle.file}: ${bundle.cycle_type} / ${bundle.status}${bundle.reason_code ? ` / ${bundle.reason_code}` : ""}${bundle.runbook_slug ? ` / ${bundle.runbook_slug}` : ""}${bundle.incident_key ? ` / ${bundle.incident_key}` : ""}${bundle.error ? ` / ${bundle.error}` : ""}`);
         }
         console.log();
       });
@@ -662,34 +840,32 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
     if (input === "/evolve") {
       await runBusy(async () => {
-        const perf = getPerformanceSummary();
-        if (!perf || perf.total_positions_closed < 5) {
-          const needed = 5 - (perf?.total_positions_closed || 0);
-          console.log(`\nNeed at least 5 closed positions to evolve. ${needed} more needed.\n`);
-          return;
-        }
-        const fs = await import("node:fs");
-        const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
-        const result = evolveThresholds(lessonsData.performance, config);
-        if (!result || Object.keys(result.changes).length === 0) {
-          console.log("\nNo threshold changes needed — current settings already match performance data.\n");
-        } else {
-          reloadScreeningThresholds();
-          console.log("\nThresholds evolved:");
-          for (const [key] of Object.entries(result.changes)) {
-            console.log(`  ${key}: ${result.rationale[key]}`);
-          }
-          console.log("\nSaved to user-config.json. Applied immediately.\n");
-        }
+        const outcome = await runThresholdEvolutionCommand({
+				getPerformanceSummary,
+				evolveThresholds,
+				reloadScreeningThresholds,
+				config,
+			});
+			if (outcome.status === "applied") {
+				console.log("\nThresholds evolved:");
+				for (const [key] of Object.entries(outcome.result.changes)) {
+					console.log(`  ${key}: ${outcome.result.rationale[key]}`);
+				}
+				console.log("\nSaved to user-config.json. Applied immediately.\n");
+				return;
+			}
+			console.log(`\n${outcome.message}\n`);
       });
       return;
     }
 
     await runBusy(async () => {
-      log("user", input);
-      const { content } = await agentLoop(input, config.llm.maxSteps, state.sessionHistory, "GENERAL", config.llm.generalModel, null, {
-        allowDangerousTools: getOperatorControlSnapshot().general_write_arm.armed,
-      });
+		log("user", input);
+		const armStatus = getOperatorControlSnapshot().general_write_arm;
+		const { content } = await agentLoop(input, config.llm.maxSteps, state.sessionHistory, "GENERAL", config.llm.generalModel, null, {
+			allowDangerousTools: armStatus.armed,
+			dangerousToolScope: armStatus.scope,
+		});
       appendHistory(input, content);
       console.log(`\n${content}\n`);
     });

@@ -4,6 +4,18 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-28
+
+- Continued the architecture cleanup by shrinking `tools/dlmm.js` through dedicated `tools/dlmm-planner.js`, `tools/dlmm-settlement.js`, `tools/dlmm-rebalance-helpers.js`, and `tools/dlmm-position-context.js` seams while keeping the public DLMM tool surface stable.
+- Continued the executor cleanup by extracting `tools/executor-safety.js`, leaving `tools/executor.js` with a thinner coordinator role over dispatch, lifecycle, and side effects.
+- Added direct tests for `screening-cycle-runner.js`, `management-cycle-runner.js`, the `/preflight` shell helper, and headless Telegram operator ingress so the orchestration layer no longer depends only on indirect hardening coverage.
+- Hardened `operator-controls.js` and `evidence-bundles.js` to use backup-aware reads and stronger write persistence, bringing them closer to the durability standard used by `state.js`, `runtime-health.js`, and the safer rollout path.
+- Fixed the headless/non-TTY operator contract so Telegram now remains available for `/health`, `/recovery`, and operator commands even when the runtime boots without a REPL or with autonomous writes blocked.
+- Fixed live `base_mint` enrichment so pool mint lookup failures now fail closed instead of degrading same-token exposure blocking for untracked live positions.
+- Aligned manual `/evolve` with the same safe live threshold-rollout engine used by automatic evolution instead of treating it as a separate manual mutation path.
+- Hardened safe live threshold evolution so it stays limited to `minFeeActiveTvlRatio` and `minOrganic`, uses realized-close data only, keeps one active rollout at a time, preserves bounded step sizes and automatic rollback, fails closed on unreadable lessons / rollout / config state, writes evidence for every mutation decision, and recovers `apply_pending` / `rollback_pending` rollout phases on startup.
+- Updated README and changelog documentation to match the current operator/runtime contract after the cleanup program and safe live evolve work.
+
 ### 2026-03-27
 
 - Centralized live governance into shared runtime-policy helpers so tracked-position exits, screening skip checks, deploy admission, and exposure guards now reuse one canonical decision surface.

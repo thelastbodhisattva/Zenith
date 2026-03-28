@@ -82,7 +82,13 @@ export async function runNonInteractiveStartup({
 	log,
 	startCronJobs,
 	maybeRunMissedBriefing,
+	startPolling,
+	onTelegramMessage,
 } = {}) {
+	if (startPolling) {
+		startPolling(onTelegramMessage);
+	}
+
   if (bootRecoveryBlockActive) {
     const recoveryBlock = summarizeRecoveryBlock(bootRecovery);
     log("recovery_block", `Non-TTY boot recovery blocked autonomous write-capable startup because ${recoveryBlock.headline}. ${recoveryBlock.detail}`);
@@ -104,6 +110,7 @@ Commands:
   /candidates    Refresh top pool list
   /candidate <n> Inspect one ranked candidate with richer signals
   /health        Show heartbeat, provider health, and ops state
+  /preflight     Run explicit risk-opening preflight and persist the latest result
   /evaluation    Show recent cycle/tool evaluation summary
   /failures      Show recent persisted bad-cycle evidence bundles
   /failure <id>  Show one evidence bundle in detail

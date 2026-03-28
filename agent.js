@@ -36,10 +36,23 @@ const GENERAL_SAFE_TOOLS = new Set([
   "list_blacklist",
 ]);
 
-export function getToolsForRole(agentType, { allowDangerousTools = false } = {}) {
+export function getToolsForRole(agentType, { allowDangerousTools = false, dangerousToolScope = null } = {}) {
   if (agentType === "MANAGER")  return tools.filter(t => MANAGER_TOOLS.has(t.function.name));
   if (agentType === "SCREENER") return tools.filter(t => SCREENER_TOOLS.has(t.function.name));
-  if (allowDangerousTools) return tools.filter((tool) => tool.function.name !== "self_update");
+  if (allowDangerousTools) {
+		const allowedScopedTools = new Set(
+			Array.isArray(dangerousToolScope?.allowed_tools)
+				? dangerousToolScope.allowed_tools
+				: [],
+		);
+		return tools.filter((tool) => {
+			const name = tool.function.name;
+			if (name === "self_update") return false;
+			if (GENERAL_SAFE_TOOLS.has(name)) return true;
+			if (allowedScopedTools.size === 0) return false;
+			return allowedScopedTools.has(name);
+		});
+	}
   return tools.filter((t) => GENERAL_SAFE_TOOLS.has(t.function.name));
 }
 

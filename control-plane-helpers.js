@@ -107,7 +107,10 @@ export function formatActionJournalReport(listActionJournalEntries, limit = 10) 
 export function formatEvidenceBundle(bundle) {
   if (!bundle) return "\nEvidence bundle not found.\n";
   const lines = ["", "Evidence bundle:", ""];
+  if (bundle.runbook_slug) lines.push(`  runbook_slug: ${bundle.runbook_slug}`);
+  if (bundle.incident_key) lines.push(`  incident_key: ${bundle.incident_key}`);
   for (const [key, value] of Object.entries(bundle)) {
+		if (key === "runbook_slug" || key === "incident_key") continue;
     lines.push(`  ${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`);
   }
   lines.push("");
@@ -181,4 +184,36 @@ export async function buildOperationalHealthReport({
     formatPortfolioGuardReport(getPortfolioGuardStatus()).trimEnd(),
     actionLines.length > 0 ? ["", "Recent operator actions:", ...actionLines, ""].join("\n") : "",
   ].filter(Boolean).join("\n");
+}
+
+export function createHeadlessTelegramCommandHandler({
+	handleOperatorCommandText,
+	buildOperationalHealthReport,
+	getRecoveryWorkflowReport,
+	getAutonomousWriteSuppression,
+	formatRecoveryReport,
+	sendMessage,
+} = {}) {
+	return async function onTelegramMessage(text) {
+		if (text === "/health") {
+			await sendMessage(await buildOperationalHealthReport()).catch(() => {});
+			return;
+		}
+		if (text === "/recovery") {
+			await sendMessage(formatRecoveryReport(
+				getRecoveryWorkflowReport({ limit: 5 }),
+				getAutonomousWriteSuppression(),
+			)).catch(() => {});
+			return;
+		}
+
+		const operatorCommand = await handleOperatorCommandText({ text, source: "telegram" });
+		if (!operatorCommand?.handled) {
+			await sendMessage("Headless mode only accepts /health, /recovery, and operator commands over Telegram.").catch(() => {});
+			return;
+		}
+		if (operatorCommand.message) {
+			await sendMessage(operatorCommand.message).catch(() => {});
+		}
+	};
 }

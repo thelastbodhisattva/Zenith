@@ -208,3 +208,32 @@ test("portfolio guard recovers from backup snapshot when primary is missing", ()
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 });
+
+test("portfolio guard fails closed when lessons history is unreadable", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-portfolio-lessons-invalid-test-"));
+	const originalProtections = { ...config.protections };
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		fs.writeFileSync("lessons.json", "{bad json");
+		Object.assign(config.protections, {
+			enabled: true,
+			maxRecentRealizedLossUsd: 100,
+			recentLossWindowHours: 24,
+			stopLossStreakLimit: 3,
+			pauseMinutes: 180,
+			maxReviewedCloses: 10,
+		});
+
+		const result = evaluatePortfolioGuard();
+		assert.equal(result.blocked, true);
+		assert.equal(result.reason_code, "LESSONS_STATE_INVALID");
+	} finally {
+		Object.assign(config.protections, originalProtections);
+		clearPortfolioGuardPause({ reason: "test cleanup" });
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});

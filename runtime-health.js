@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 
 import {
@@ -23,6 +22,7 @@ function emptyHealth() {
     portfolio_guard: null,
     general_write_arm: null,
     recovery_resume_override: null,
+    preflight: null,
   };
 }
 
@@ -95,6 +95,9 @@ export function formatRuntimeHealthReport(health = getRuntimeHealth()) {
   }
   if (health.recovery_resume_override) {
     lines.push(`  recovery_resume_override: ${health.recovery_resume_override.active ? "active" : "inactive"}${health.recovery_resume_override.override_until ? ` / ${health.recovery_resume_override.override_until}` : ""}${health.recovery_resume_override.source ? ` / ${health.recovery_resume_override.source}` : ""}${health.recovery_resume_override.reason ? ` / ${health.recovery_resume_override.reason}` : ""}`);
+  }
+  if (health.preflight) {
+	lines.push(`  preflight: ${health.preflight.status}${health.preflight.reason ? ` / ${health.preflight.reason}` : ""}${health.preflight.valid_until ? ` / ${health.preflight.valid_until}` : ""}`);
   }
 
   const providers = Object.entries(health.provider_health || {});

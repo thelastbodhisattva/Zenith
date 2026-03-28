@@ -27,26 +27,78 @@ test("operator command handler blocks resume on journal invalid", async () => {
 });
 
 test("operator command handler arms writes and reports window", async () => {
-  const result = await handleOperatorCommandText({
-    text: "/arm 7 testing",
-    source: "test",
-    config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+	const result = await handleOperatorCommandText({
+		text: "/arm 7 tool=deploy_position pool=pool-1 testing",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
     getRecoveryWorkflowReport: () => ({ status: "clear" }),
     getAutonomousWriteSuppression: () => ({ suppressed: false, reason: null }),
     clearPortfolioGuardPause: () => ({ cleared: false }),
     setAutonomousWriteSuppression: () => {},
     acknowledgeRecoveryResume: () => ({ override_until: null }),
-    armGeneralWriteTools: ({ minutes }) => ({ armed_until: `until+${minutes}` }),
-    disarmGeneralWriteTools: () => ({ armed: false }),
-    getOperatorControlSnapshot: () => ({
-      general_write_arm: { armed: true, armed_until: "until+7" },
-      recovery_resume_override: { active: false, override_until: null },
-    }),
-    refreshRuntimeHealth: () => {},
-  });
+		armGeneralWriteTools: ({ minutes, scope }) => ({ armed_until: `until+${minutes}`, scope }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: true, armed_until: "until+7", scope: { allowed_tools: ["deploy_position"], pool_address: "pool-1" } },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
 
 	assert.equal(result.handled, true);
 	assert.match(result.message, /armed for 7 minute\(s\)/i);
+	assert.match(result.message, /tools=deploy_position/i);
+});
+
+test("operator command handler rejects unscoped arm requests", async () => {
+	const result = await handleOperatorCommandText({
+		text: "/arm 7 testing",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "clear" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: false }),
+		setAutonomousWriteSuppression: () => {},
+		acknowledgeRecoveryResume: () => ({ override_until: null }),
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.match(result.message, /require at least one explicit tool/i);
+});
+
+test("operator command handler parses scoped arm options", async () => {
+	let receivedScope = null;
+	await handleOperatorCommandText({
+		text: "/arm 5 tool=deploy_position pool=pool-1 max_sol=0.5 once scoped deploy",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "clear" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: false }),
+		setAutonomousWriteSuppression: () => {},
+		acknowledgeRecoveryResume: () => ({ override_until: null }),
+		armGeneralWriteTools: ({ scope }) => {
+			receivedScope = scope;
+			return { armed_until: "until+5", scope };
+		},
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: true, armed_until: "until+5", scope: receivedScope },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+	assert.deepEqual(receivedScope, {
+		allowed_tools: ["deploy_position"],
+		pool_address: "pool-1",
+		max_amount_sol: 0.5,
+		one_shot: true,
+	});
 });
 
 test("operator resume clears suppression without clearing portfolio guard pause", async () => {

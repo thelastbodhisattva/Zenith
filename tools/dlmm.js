@@ -26,6 +26,31 @@ import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import { getPoolDeployCooldown } from "../pool-memory.js";
 import { appendActionLifecycle } from "../action-journal.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
+import {
+	calculateDynamicBinTierPlan,
+	chooseDistributionStrategyPlan,
+} from "./dlmm-planner.js";
+import {
+	buildPoolPlanningData,
+	calculateBalanceDeltas,
+	classifyRangeLocation,
+	getOutOfRangeDirection,
+	normalizeCompoundingLocation,
+	resolveBinSnapshot,
+	resolveCompoundingBias,
+} from "./dlmm-rebalance-helpers.js";
+import {
+	buildTrackedPositionFallback,
+	captureBalanceSnapshotForMints,
+	getPositionExecutionContext,
+	resolvePoolTokenMints,
+} from "./dlmm-position-context.js";
+import {
+	buildClosePerformancePayload,
+	evaluatePostCloseSettlementObservation,
+	getWalletTokenBalance,
+	waitForPostCloseSettlement,
+} from "./dlmm-settlement.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -71,7 +96,6 @@ function getWallet() {
 const poolCache = new Map();
 
 const MAX_BINS_PER_SIDE = 34;
-const MIN_BINS_PER_SIDE = 6;
 
 function toFiniteNumber(value, fallback = 0) {
   const num = Number(value);
@@ -91,292 +115,6 @@ function roundMetric(value, decimals = 4) {
   return Math.round(value * factor) / factor;
 }
 
-function normalizeExpectedVolumeProfile(profile) {
-  const normalized = String(profile || "balanced").trim().toLowerCase();
-  const profileMap = {
-    low: "low",
-    light: "low",
-    thin: "low",
-    balanced: "balanced",
-    moderate: "balanced",
-    normal: "balanced",
-    medium: "balanced",
-    high: "high",
-    heavy: "high",
-    strong: "high",
-    bursty: "bursty",
-    spiky: "bursty",
-    surge: "bursty",
-    surging: "bursty",
-  };
-  return profileMap[normalized] || "balanced";
-}
-
-function normalizeTrendBias(trendBias) {
-  if (typeof trendBias === "number") {
-    const value = clampNumber(trendBias, -1, 1);
-    return {
-      label: value >= 0.25 ? "bullish" : value <= -0.25 ? "bearish" : "neutral",
-      value,
-    };
-  }
-
-  const normalized = String(trendBias || "neutral").trim().toLowerCase();
-  const trendMap = {
-    bullish: 0.75,
-    bull: 0.75,
-    up: 0.75,
-    uptrend: 0.75,
-    bearish: -0.75,
-    bear: -0.75,
-    down: -0.75,
-    downtrend: -0.75,
-    neutral: 0,
-    flat: 0,
-    sideways: 0,
-    range: 0,
-  };
-  const value = trendMap[normalized] ?? 0;
-  return {
-    label: value >= 0.25 ? "bullish" : value <= -0.25 ? "bearish" : "neutral",
-    value,
-  };
-}
-
-function normalizeWeights(weights) {
-  const total = weights.reduce((sum, weight) => sum + weight, 0);
-  if (total <= 0) {
-    return weights.map(() => roundMetric(1 / weights.length));
-  }
-  return weights.map((weight) => roundMetric(weight / total));
-}
-
-function splitIntegerByWeights(total, weights) {
-  if (total <= 0) return weights.map(() => 0);
-
-  const normalizedWeights = normalizeWeights(weights);
-  const positiveIndexes = normalizedWeights
-    .map((weight, index) => (weight > 0 ? index : -1))
-    .filter((index) => index >= 0);
-  const guaranteed = total >= positiveIndexes.length ? 1 : 0;
-  const segments = normalizedWeights.map((weight) => (weight > 0 ? guaranteed : 0));
-  let remaining = total - segments.reduce((sum, segment) => sum + segment, 0);
-
-  if (remaining <= 0) {
-    return segments;
-  }
-
-  const rawAllocations = normalizedWeights.map((weight, index) => ({
-    index,
-    raw: weight * remaining,
-  }));
-
-  for (const allocation of rawAllocations) {
-    const whole = Math.floor(allocation.raw);
-    segments[allocation.index] += whole;
-    remaining -= whole;
-    allocation.fraction = allocation.raw - whole;
-  }
-
-  rawAllocations
-    .sort((a, b) => (b.fraction || 0) - (a.fraction || 0))
-    .slice(0, remaining)
-    .forEach(({ index }) => {
-      segments[index] += 1;
-    });
-
-  return segments;
-}
-
-function resolveSideBinTarget(sixHourVolatility) {
-  const volatility = Math.max(0, toFiniteNumber(sixHourVolatility, 0));
-  if (volatility <= 2) return 10;
-  if (volatility <= 4) return 12;
-  if (volatility <= 8) return 16;
-  if (volatility <= 12) return 20;
-  if (volatility <= 18) return 24;
-  if (volatility <= 25) return 30;
-  return MAX_BINS_PER_SIDE;
-}
-
-function resolveTierSplitWeights(sixHourVolatility) {
-  const volatility = Math.max(0, toFiniteNumber(sixHourVolatility, 0));
-  if (volatility <= 6) return { outer: 0.2, inner: 0.25, center: 0.55 };
-  if (volatility <= 12) return { outer: 0.22, inner: 0.28, center: 0.5 };
-  if (volatility <= 18) return { outer: 0.24, inner: 0.3, center: 0.46 };
-  if (volatility <= 25) return { outer: 0.26, inner: 0.31, center: 0.43 };
-  return { outer: 0.28, inner: 0.32, center: 0.4 };
-}
-
-function normalizePoolPlanningInputs(poolData = {}) {
-  return {
-    volatility: Math.max(
-      0,
-      toFiniteNumber(poolData.six_hour_volatility ?? poolData.volatility_6h ?? poolData.volatility, 0)
-    ),
-    feeTvlRatio: Math.max(0, toFiniteNumber(poolData.fee_tvl_ratio ?? poolData.feeActiveTvlRatio, 0)),
-    organicScore: Math.max(0, toFiniteNumber(poolData.organic_score ?? poolData.organic, 0)),
-    binStep: Math.max(0, toFiniteNumber(poolData.bin_step, 0)),
-    priceChangePct: toFiniteNumber(
-      poolData.price_change_pct ?? poolData.priceChangePct ?? poolData.price_change_24h,
-      0
-    ),
-    activeTvl: Math.max(0, toFiniteNumber(poolData.active_tvl ?? poolData.tvl ?? poolData.liquidity, 0)),
-    volume24h: Math.max(0, toFiniteNumber(poolData.volume_24h ?? poolData.trade_volume_24h, 0)),
-  };
-}
-
-function buildDistributionWeights(strategy, volumeProfile, priceChangePct) {
-  const inferredTrend = normalizeTrendBias(clampNumber(priceChangePct / 20, -1, 1));
-
-  if (strategy === "bid_ask") {
-    const lowerWeight = 0.68 - Math.max(0, inferredTrend.value) * 0.08 + Math.max(0, -inferredTrend.value) * 0.06;
-    const centerWeight = volumeProfile === "bursty" ? 0.36 : volumeProfile === "high" ? 0.34 : 0.32;
-    const normalized = normalizeWeights([lowerWeight, centerWeight, 0]);
-    return {
-      lower: normalized[0],
-      center: normalized[1],
-      upper: normalized[2],
-      tokenBias: "quote_heavy",
-      activeBinTreatment: "defensive",
-      inferredTrend,
-    };
-  }
-
-  let lowerWeight = 0.24;
-  const centerWeight = volumeProfile === "high" ? 0.56 : volumeProfile === "bursty" ? 0.48 : 0.52;
-  let upperWeight = 0.24;
-
-  if (inferredTrend.value > 0) {
-    const shift = 0.08 * inferredTrend.value;
-    lowerWeight -= shift;
-    upperWeight += shift;
-  } else if (inferredTrend.value < 0) {
-    const shift = 0.08 * Math.abs(inferredTrend.value);
-    lowerWeight += shift;
-    upperWeight -= shift;
-  }
-
-  const normalized = normalizeWeights([lowerWeight, centerWeight, upperWeight]);
-  return {
-    lower: normalized[0],
-    center: normalized[1],
-    upper: normalized[2],
-    tokenBias: "balanced",
-    activeBinTreatment: volumeProfile === "bursty" ? "buffered" : "balanced",
-    inferredTrend,
-  };
-}
-
-function buildTierRange(side, startOffset, endOffset, binsBelow, binsAbove, includesActiveBin = false) {
-  return {
-    side,
-    start_offset: startOffset,
-    end_offset: endOffset,
-    bins_below: clampWholeNumber(binsBelow, 0, MAX_BINS_PER_SIDE),
-    bins_above: clampWholeNumber(binsAbove, 0, MAX_BINS_PER_SIDE),
-    includes_active_bin: includesActiveBin,
-  };
-}
-
-function buildDynamicBinTierPlan(sixHourVolatility, trendBias = "neutral") {
-  const normalizedVolatility = Math.max(0, toFiniteNumber(sixHourVolatility, 0));
-  const normalizedTrend = normalizeTrendBias(trendBias);
-  const baseSideBins = resolveSideBinTarget(normalizedVolatility);
-  const lowerMultiplier = normalizedTrend.value < 0
-    ? 1 + Math.abs(normalizedTrend.value) * 0.25
-    : 1 - normalizedTrend.value * 0.15;
-  const upperMultiplier = normalizedTrend.value > 0
-    ? 1 + normalizedTrend.value * 0.25
-    : 1 - Math.abs(normalizedTrend.value) * 0.15;
-
-  const lowerTotal = clampWholeNumber(baseSideBins * lowerMultiplier, MIN_BINS_PER_SIDE, MAX_BINS_PER_SIDE);
-  const upperTotal = clampWholeNumber(baseSideBins * upperMultiplier, MIN_BINS_PER_SIDE, MAX_BINS_PER_SIDE);
-  const splitWeights = resolveTierSplitWeights(normalizedVolatility);
-
-  const [lowerOuterBins, lowerInnerBins, centerLowerBins] = splitIntegerByWeights(lowerTotal, [
-    splitWeights.outer,
-    splitWeights.inner,
-    splitWeights.center,
-  ]);
-  const [centerUpperBins, upperInnerBins, upperOuterBins] = splitIntegerByWeights(upperTotal, [
-    splitWeights.center,
-    splitWeights.inner,
-    splitWeights.outer,
-  ]);
-
-  const lowerSideAllocation = 0.34 - normalizedTrend.value * 0.1;
-  const upperSideAllocation = 0.34 + normalizedTrend.value * 0.1;
-  const [lowerOuterWeight, lowerInnerWeight, centerWeight, upperInnerWeight, upperOuterWeight] = normalizeWeights([
-    lowerSideAllocation * 0.35,
-    lowerSideAllocation * 0.65,
-    0.32,
-    upperSideAllocation * 0.65,
-    upperSideAllocation * 0.35,
-  ]);
-
-  const centerStart = centerLowerBins > 0 ? -centerLowerBins : 0;
-  const centerEnd = centerUpperBins > 0 ? centerUpperBins : 0;
-  const lowerInnerStart = -(centerLowerBins + lowerInnerBins);
-  const lowerInnerEnd = -(centerLowerBins + 1);
-  const lowerOuterEnd = -(centerLowerBins + lowerInnerBins + 1);
-  const upperInnerStart = centerUpperBins + 1;
-  const upperInnerEnd = centerUpperBins + upperInnerBins;
-  const upperOuterStart = centerUpperBins + upperInnerBins + 1;
-
-  const tiers = [
-    {
-      id: "lower_outer",
-      label: "Lower Outer",
-      allocation_weight: lowerOuterWeight,
-      ...buildTierRange("lower", -lowerTotal, lowerOuterEnd, lowerOuterBins, 0),
-    },
-    {
-      id: "lower_inner",
-      label: "Lower Inner",
-      allocation_weight: lowerInnerWeight,
-      ...buildTierRange("lower", lowerInnerStart, lowerInnerEnd, lowerInnerBins, 0),
-    },
-    {
-      id: "center",
-      label: "Center",
-      allocation_weight: centerWeight,
-      ...buildTierRange("center", centerStart, centerEnd, centerLowerBins, centerUpperBins, true),
-    },
-    {
-      id: "upper_inner",
-      label: "Upper Inner",
-      allocation_weight: upperInnerWeight,
-      ...buildTierRange("upper", upperInnerStart, upperInnerEnd, 0, upperInnerBins),
-    },
-    {
-      id: "upper_outer",
-      label: "Upper Outer",
-      allocation_weight: upperOuterWeight,
-      ...buildTierRange("upper", upperOuterStart, upperTotal, 0, upperOuterBins),
-    },
-  ];
-
-  return {
-    six_hour_volatility: roundMetric(normalizedVolatility, 2),
-    trend_bias: normalizedTrend.label,
-    trend_bias_score: roundMetric(normalizedTrend.value, 2),
-    max_bins_per_side: MAX_BINS_PER_SIDE,
-    range_plan: {
-      bins_below: lowerTotal,
-      bins_above: upperTotal,
-      total_bins: lowerTotal + upperTotal,
-      center_bin_included: true,
-      hard_clamped: lowerTotal === MAX_BINS_PER_SIDE || upperTotal === MAX_BINS_PER_SIDE,
-    },
-    distribution_weights: {
-      lower: roundMetric(lowerOuterWeight + lowerInnerWeight),
-      center: centerWeight,
-      upper: roundMetric(upperInnerWeight + upperOuterWeight),
-    },
-    tiers,
-  };
-}
 
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
@@ -418,96 +156,11 @@ export async function getActiveBin({ pool_address }) {
 }
 
 export async function chooseDistributionStrategy({ pool_data = {}, expected_volume_profile = "balanced" }) {
-  const poolData = normalizePoolPlanningInputs(pool_data);
-  const volumeProfile = normalizeExpectedVolumeProfile(expected_volume_profile);
-
-  let spotScore = 0;
-  let bidAskScore = 0;
-
-  if (volumeProfile === "high") spotScore += 2;
-  if (volumeProfile === "balanced") {
-    spotScore += 1;
-    bidAskScore += 1;
-  }
-  if (volumeProfile === "low") bidAskScore += 2;
-  if (volumeProfile === "bursty") bidAskScore += 2;
-
-  if (poolData.volatility >= 18) bidAskScore += 2;
-  else if (poolData.volatility >= 10) {
-    bidAskScore += 1;
-    spotScore += 1;
-  } else {
-    spotScore += 2;
-  }
-
-  if (Math.abs(poolData.priceChangePct) >= 15) bidAskScore += 2;
-  else if (Math.abs(poolData.priceChangePct) >= 8) bidAskScore += 1;
-  else spotScore += 1;
-
-  if (poolData.feeTvlRatio >= 0.08) spotScore += 2;
-  else if (poolData.feeTvlRatio >= 0.04) {
-    spotScore += 1;
-    bidAskScore += 1;
-  } else {
-    bidAskScore += 1;
-  }
-
-  if (poolData.binStep >= 110) bidAskScore += 1;
-  else if (poolData.binStep > 0 && poolData.binStep <= 90) spotScore += 1;
-
-  if (poolData.organicScore >= 80) spotScore += 1;
-  else if (poolData.organicScore > 0 && poolData.organicScore < 65) bidAskScore += 1;
-
-  if (poolData.activeTvl >= 100000) spotScore += 1;
-  else if (poolData.activeTvl > 0 && poolData.activeTvl < 25000) bidAskScore += 1;
-
-  const strategy = spotScore > bidAskScore
-    ? "spot"
-    : bidAskScore > spotScore
-      ? "bid_ask"
-      : volumeProfile === "high" || volumeProfile === "balanced"
-        ? "spot"
-        : "bid_ask";
-
-  const distribution = buildDistributionWeights(strategy, volumeProfile, poolData.priceChangePct);
-
-  return {
-    strategy,
-    expected_volume_profile: volumeProfile,
-    strategy_scores: {
-      bid_ask: bidAskScore,
-      spot: spotScore,
-    },
-    distribution_plan: {
-      lower_allocation: distribution.lower,
-      center_allocation: distribution.center,
-      upper_allocation: distribution.upper,
-      lower_enabled: true,
-      center_enabled: true,
-      upper_enabled: strategy === "spot",
-      token_bias: distribution.tokenBias,
-      active_bin_treatment: distribution.activeBinTreatment,
-    },
-    pool_snapshot: {
-      volatility: roundMetric(poolData.volatility, 2),
-      fee_tvl_ratio: roundMetric(poolData.feeTvlRatio, 4),
-      organic_score: roundMetric(poolData.organicScore, 2),
-      bin_step: poolData.binStep,
-      price_change_pct: roundMetric(poolData.priceChangePct, 2),
-      active_tvl: roundMetric(poolData.activeTvl, 2),
-      volume_24h: roundMetric(poolData.volume24h, 2),
-    },
-    next_step_inputs: {
-      six_hour_volatility: roundMetric(poolData.volatility, 2),
-      trend_bias: distribution.inferredTrend.label,
-      max_bins_per_side: MAX_BINS_PER_SIDE,
-    },
-    supported_strategies: ["bid_ask", "spot"],
-  };
+  return chooseDistributionStrategyPlan({ pool_data, expected_volume_profile });
 }
 
 export async function calculateDynamicBinTiers({ six_hour_volatility, trend_bias = "neutral" }) {
-  return buildDynamicBinTierPlan(six_hour_volatility, trend_bias);
+  return calculateDynamicBinTierPlan(six_hour_volatility, trend_bias);
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
@@ -528,6 +181,7 @@ export async function deployPosition({
   organic_score,
   initial_value_usd,
   decision_context = null,
+  bypass_portfolio_guard = false,
 }) {
   pool_address = normalizeMint(pool_address);
   const portfolioGuard = evaluatePortfolioGuard();
@@ -547,15 +201,17 @@ export async function deployPosition({
   });
   if (!deployAdmission.pass) {
     if (deployAdmission.code === DEPLOY_GOVERNANCE_CODES.PORTFOLIO_GUARD_ACTIVE) {
-      return {
-        success: false,
-        blocked: true,
-        reason: "portfolio_guard_pause_active",
-        pool: pool_address,
-        pause_until: portfolioGuard.pause_until,
-        guard_reason: portfolioGuard.reason,
-        guard_reason_code: portfolioGuard.reason_code,
-      };
+      if (!bypass_portfolio_guard) {
+        return {
+          success: false,
+          blocked: true,
+          reason: "portfolio_guard_pause_active",
+          pool: pool_address,
+          pause_until: portfolioGuard.pause_until,
+          guard_reason: portfolioGuard.reason,
+          guard_reason_code: portfolioGuard.reason_code,
+        };
+      }
     }
     if (deployAdmission.code === DEPLOY_GOVERNANCE_CODES.POOL_LOW_YIELD_COOLDOWN_ACTIVE) {
       return {
@@ -869,7 +525,23 @@ export async function getMyPositions({ force = false } = {}) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
-    const mintMaps = await Promise.all(uniquePools.map((pool) => resolvePoolTokenMints(pool)));
+	const mintMaps = await Promise.all(
+		uniquePools.map((pool) =>
+			resolvePoolTokenMints({
+				poolAddress: pool,
+				getPool,
+			}),
+		),
+	);
+	const mintLookupFailure = mintMaps.find((entry) => entry?.error);
+	if (mintLookupFailure) {
+		return {
+			wallet: walletAddress,
+			total_positions: 0,
+			positions: [],
+			error: `pool mint enrichment failed: ${mintLookupFailure.error}`,
+		};
+	}
     const mintsByPool = {};
     uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
@@ -970,7 +642,23 @@ export async function getWalletPositions({ wallet_address }) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
-    const mintMaps = await Promise.all(uniquePools.map((pool) => resolvePoolTokenMints(pool)));
+	const mintMaps = await Promise.all(
+		uniquePools.map((pool) =>
+			resolvePoolTokenMints({
+				poolAddress: pool,
+				getPool,
+			}),
+		),
+	);
+	const mintLookupFailure = mintMaps.find((entry) => entry?.error);
+	if (mintLookupFailure) {
+		return {
+			wallet: wallet_address,
+			total_positions: 0,
+			positions: [],
+			error: `pool mint enrichment failed: ${mintLookupFailure.error}`,
+		};
+	}
     const mintsByPool = {};
     uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
@@ -1026,321 +714,12 @@ export async function searchPools({ query, limit = 10 }) {
   };
 }
 
-function toNullableFiniteNumber(value) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
-}
-
-function resolveExpectedVolumeProfile(feeTvlRatio) {
-  const ratio = Math.max(0, toFiniteNumber(feeTvlRatio, 0));
-  if (ratio >= 0.08) return "high";
-  if (ratio >= 0.03) return "balanced";
-  if (ratio <= 0.01) return "low";
-  return "balanced";
-}
-
-function inferTrendBiasFromBins(lowerBin, upperBin, activeBin) {
-  if (!Number.isFinite(lowerBin) || !Number.isFinite(upperBin) || !Number.isFinite(activeBin)) {
-    return "neutral";
-  }
-  if (activeBin > upperBin) return "bullish";
-  if (activeBin < lowerBin) return "bearish";
-
-  const span = upperBin - lowerBin;
-  if (span <= 0) return "neutral";
-  const ratio = (activeBin - lowerBin) / span;
-  if (ratio >= 0.6) return "bullish";
-  if (ratio <= 0.4) return "bearish";
-  return "neutral";
-}
-
-function getOutOfRangeDirection(lowerBin, upperBin, activeBin) {
-  if (!Number.isFinite(lowerBin) || !Number.isFinite(upperBin) || !Number.isFinite(activeBin)) {
-    return null;
-  }
-  if (activeBin > upperBin) return "above";
-  if (activeBin < lowerBin) return "below";
-  return null;
-}
-
-function classifyRangeLocation({ lowerBin, upperBin, activeBin }) {
-  if (!Number.isFinite(lowerBin) || !Number.isFinite(upperBin) || !Number.isFinite(activeBin)) {
-    return {
-      location: "unknown",
-      in_range: null,
-      normalized_position: null,
-      distance_to_lower_bins: null,
-      distance_to_upper_bins: null,
-    };
-  }
-
-  if (upperBin <= lowerBin) {
-    return {
-      location: "unknown",
-      in_range: null,
-      normalized_position: null,
-      distance_to_lower_bins: null,
-      distance_to_upper_bins: null,
-    };
-  }
-
-  if (activeBin < lowerBin) {
-    return {
-      location: "out_below",
-      in_range: false,
-      normalized_position: roundMetric((activeBin - lowerBin) / (upperBin - lowerBin), 4),
-      distance_to_lower_bins: activeBin - lowerBin,
-      distance_to_upper_bins: upperBin - activeBin,
-    };
-  }
-
-  if (activeBin > upperBin) {
-    return {
-      location: "out_above",
-      in_range: false,
-      normalized_position: roundMetric((activeBin - lowerBin) / (upperBin - lowerBin), 4),
-      distance_to_lower_bins: activeBin - lowerBin,
-      distance_to_upper_bins: upperBin - activeBin,
-    };
-  }
-
-  const span = upperBin - lowerBin;
-  const ratio = (activeBin - lowerBin) / span;
-  const location = ratio <= 0.33 ? "near_lower" : ratio >= 0.67 ? "near_upper" : "near_center";
-
-  return {
-    location,
-    in_range: true,
-    normalized_position: roundMetric(ratio, 4),
-    distance_to_lower_bins: activeBin - lowerBin,
-    distance_to_upper_bins: upperBin - activeBin,
-  };
-}
-
 function roundAmount(value, decimals = 6) {
   const sanitized = Math.max(0, toFiniteNumber(value, 0));
   const factor = Math.pow(10, decimals);
   return Math.floor(sanitized * factor) / factor;
 }
 
-function findTokenBalanceByMint(walletBalances, mint) {
-  if (!mint || !walletBalances || !Array.isArray(walletBalances.tokens)) return null;
-  const normalizedMint = normalizeMint(mint);
-  return walletBalances.tokens.find((token) => normalizeMint(token.mint) === normalizedMint) || null;
-}
-
-function getWalletBalanceByMint(walletBalances, mint) {
-  const normalizedMint = normalizeMint(mint);
-  if (normalizedMint === config.tokens.SOL) {
-    return toNullableFiniteNumber(walletBalances?.sol);
-  }
-
-  const token = findTokenBalanceByMint(walletBalances, normalizedMint);
-  if (!token) return 0;
-  return toNullableFiniteNumber(token.balance);
-}
-
-async function captureBalanceSnapshotForMints({ token_x_mint, token_y_mint, phase }) {
-  const balances = await getWalletBalances();
-  if (balances?.error) {
-    return {
-      error: `Unable to load wallet balances ${phase}: ${balances.error}`,
-    };
-  }
-
-  const tokenXAmount = getWalletBalanceByMint(balances, token_x_mint);
-  const tokenYAmount = getWalletBalanceByMint(balances, token_y_mint);
-
-  if (tokenXAmount == null || tokenYAmount == null) {
-    return {
-      error: `Unable to read token balances ${phase} for pool token mints`,
-    };
-  }
-
-  return {
-    token_x_mint: normalizeMint(token_x_mint),
-    token_y_mint: normalizeMint(token_y_mint),
-    amount_x: tokenXAmount,
-    amount_y: tokenYAmount,
-    sampled_at: new Date().toISOString(),
-  };
-}
-
-function calculateBalanceDeltas(beforeSnapshot, afterSnapshot) {
-  if (!beforeSnapshot || !afterSnapshot) {
-    return { error: "Cannot compute balance deltas without before/after snapshots" };
-  }
-
-  const deltaXRaw = toNullableFiniteNumber(afterSnapshot.amount_x - beforeSnapshot.amount_x);
-  const deltaYRaw = toNullableFiniteNumber(afterSnapshot.amount_y - beforeSnapshot.amount_y);
-
-  if (deltaXRaw == null || deltaYRaw == null) {
-    return { error: "Computed non-finite balance deltas" };
-  }
-
-  const amountX = roundAmount(Math.max(0, deltaXRaw), 6);
-  const amountY = roundAmount(Math.max(0, deltaYRaw), 6);
-
-  if (amountX <= 0 && amountY <= 0) {
-    return {
-      error: "No positive recovered token deltas detected after close",
-      delta_x_raw: roundMetric(deltaXRaw, 8),
-      delta_y_raw: roundMetric(deltaYRaw, 8),
-    };
-  }
-
-  return {
-    amount_x: amountX,
-    amount_y: amountY,
-    delta_x_raw: roundMetric(deltaXRaw, 8),
-    delta_y_raw: roundMetric(deltaYRaw, 8),
-  };
-}
-
-function resolveBinSnapshot(position, pnl) {
-  const lowerBin = toNullableFiniteNumber(pnl?.lower_bin) ?? toNullableFiniteNumber(position?.lower_bin);
-  const upperBin = toNullableFiniteNumber(pnl?.upper_bin) ?? toNullableFiniteNumber(position?.upper_bin);
-  const activeBin = toNullableFiniteNumber(pnl?.active_bin) ?? toNullableFiniteNumber(position?.active_bin);
-  const inRange = typeof pnl?.in_range === "boolean"
-    ? pnl.in_range
-    : typeof position?.in_range === "boolean"
-      ? position.in_range
-      : null;
-
-  return { lowerBin, upperBin, activeBin, inRange };
-}
-
-function buildPoolPlanningData(position, binSnapshot) {
-  const observedWidth = Number.isFinite(binSnapshot.lowerBin) && Number.isFinite(binSnapshot.upperBin)
-    ? Math.max(2, Math.abs(binSnapshot.upperBin - binSnapshot.lowerBin) / 3)
-    : 8;
-
-  const sixHourVolatility = roundMetric(
-    Math.max(0, toFiniteNumber(position?.volatility, observedWidth)),
-    2
-  );
-  const trendBias = inferTrendBiasFromBins(binSnapshot.lowerBin, binSnapshot.upperBin, binSnapshot.activeBin);
-  const syntheticPriceChange = trendBias === "bullish" ? 12 : trendBias === "bearish" ? -12 : 0;
-  const feeTvlRatio = Math.max(0, toFiniteNumber(position?.fee_tvl_ratio, 0));
-
-  return {
-    pool_data: {
-      six_hour_volatility: sixHourVolatility,
-      fee_tvl_ratio: feeTvlRatio,
-      organic_score: Math.max(0, toFiniteNumber(position?.organic_score, 0)),
-      bin_step: Math.max(0, toFiniteNumber(position?.bin_step, 0)),
-      price_change_pct: syntheticPriceChange,
-      active_tvl: Math.max(0, toFiniteNumber(position?.total_value_usd, 0)),
-      volume_24h: Math.max(0, toFiniteNumber(position?.volume_24h, 0)),
-    },
-    trend_bias: trendBias,
-    expected_volume_profile: resolveExpectedVolumeProfile(feeTvlRatio),
-  };
-}
-
-async function resolvePoolTokenMints(poolAddress) {
-  if (!poolAddress) return null;
-  try {
-    const pool = await getPool(poolAddress);
-    return {
-      token_x_mint: pool?.lbPair?.tokenXMint?.toString() || null,
-      token_y_mint: pool?.lbPair?.tokenYMint?.toString() || null,
-    };
-  } catch (error) {
-    return { error: error.message };
-  }
-}
-
-function buildTrackedPositionFallback(position_address) {
-  const tracked = getTrackedPosition(position_address);
-  if (!tracked || tracked.closed) return null;
-
-  return {
-    position: tracked.position,
-    pool: tracked.pool,
-    pair: tracked.pool_name || tracked.pool?.slice(0, 8) || null,
-    pool_name: tracked.pool_name || null,
-    strategy: tracked.strategy || null,
-    bin_step: tracked.bin_step ?? null,
-    volatility: tracked.volatility ?? null,
-    fee_tvl_ratio: tracked.fee_tvl_ratio ?? null,
-    organic_score: tracked.organic_score ?? null,
-    lower_bin: tracked.bin_range?.min ?? null,
-    upper_bin: tracked.bin_range?.max ?? null,
-    active_bin: tracked.active_bin_at_deploy ?? null,
-    in_range: tracked.out_of_range_since ? false : true,
-    unclaimed_fees_usd: 0,
-    total_value_usd: tracked.initial_value_usd ?? 0,
-    source: "state_fallback",
-  };
-}
-
-async function getPositionExecutionContext(position_address) {
-  const isDryRun = process.env.DRY_RUN === "true";
-  const positionsResult = await getMyPositions({ force: true });
-  if (positionsResult?.error) {
-    if (isDryRun) {
-      const fallbackPosition = buildTrackedPositionFallback(position_address);
-      if (fallbackPosition) {
-        const binSnapshot = resolveBinSnapshot(fallbackPosition, null);
-        const rangeLocation = classifyRangeLocation(binSnapshot);
-        return {
-          position: fallbackPosition,
-          pnl: null,
-          bin_snapshot: binSnapshot,
-          range_location: rangeLocation,
-          in_range: binSnapshot.inRange,
-          context_source: "state_fallback",
-        };
-      }
-    }
-    return {
-      error: `Unable to load open positions: ${positionsResult.error}`,
-      positions: positionsResult.positions || [],
-    };
-  }
-
-  const position = (positionsResult.positions || []).find((item) => item.position === position_address);
-  if (!position) {
-    if (isDryRun) {
-      const fallbackPosition = buildTrackedPositionFallback(position_address);
-      if (fallbackPosition) {
-        const binSnapshot = resolveBinSnapshot(fallbackPosition, null);
-        const rangeLocation = classifyRangeLocation(binSnapshot);
-        return {
-          position: fallbackPosition,
-          pnl: null,
-          bin_snapshot: binSnapshot,
-          range_location: rangeLocation,
-          in_range: binSnapshot.inRange,
-          context_source: "state_fallback",
-        };
-      }
-    }
-    return {
-      error: `Position ${position_address} was not found in open positions`,
-      positions: positionsResult.positions || [],
-    };
-  }
-
-  let pnl = null;
-  try {
-    pnl = await getPositionPnl({ pool_address: position.pool, position_address });
-  } catch (error) {
-    pnl = { error: error.message };
-  }
-
-  const binSnapshot = resolveBinSnapshot(position, pnl);
-  const rangeLocation = classifyRangeLocation(binSnapshot);
-
-  return {
-    position,
-    pnl,
-    bin_snapshot: binSnapshot,
-    range_location: rangeLocation,
-    in_range: binSnapshot.inRange,
-  };
-}
 
 export async function rebalanceOnExit({
   position_address,
@@ -1350,25 +729,19 @@ export async function rebalanceOnExit({
   journal_workflow_id = null,
   decision_context = null,
 } = {}) {
-  const portfolioGuard = evaluatePortfolioGuard();
-  if (portfolioGuard.blocked) {
-    return {
-      success: false,
-      blocked: true,
-      reason: "portfolio_guard_pause_active",
-      position: position_address,
-      pause_until: portfolioGuard.pause_until,
-      guard_reason: portfolioGuard.reason,
-      guard_reason_code: portfolioGuard.reason_code,
-    };
-  }
-
   position_address = normalizeMint(position_address);
   if (!position_address) {
     return { success: false, error: "position_address is required" };
   }
 
-  const context = await getPositionExecutionContext(position_address);
+	const context = await getPositionExecutionContext(position_address, {
+		getMyPositions,
+		getPositionPnl,
+		buildTrackedFallback: (address) => buildTrackedPositionFallback(address, { getTrackedPosition }),
+		resolveBinSnapshot,
+		classifyRangeLocation,
+		isDryRun: process.env.DRY_RUN === "true",
+	});
   if (context.error) {
     return { success: false, error: context.error, position: position_address };
   }
@@ -1461,7 +834,10 @@ export async function rebalanceOnExit({
     };
   }
 
-  const poolTokenMints = await resolvePoolTokenMints(context.position.pool);
+	const poolTokenMints = await resolvePoolTokenMints({
+		poolAddress: context.position.pool,
+		getPool,
+	});
   if (!poolTokenMints || poolTokenMints.error || !poolTokenMints.token_x_mint || !poolTokenMints.token_y_mint) {
     return {
       success: false,
@@ -1471,11 +847,14 @@ export async function rebalanceOnExit({
     };
   }
 
-  const beforeCloseSnapshot = await captureBalanceSnapshotForMints({
-    token_x_mint: poolTokenMints.token_x_mint,
-    token_y_mint: poolTokenMints.token_y_mint,
-    phase: "before close",
-  });
+	const beforeCloseSnapshot = await captureBalanceSnapshotForMints({
+		token_x_mint: poolTokenMints.token_x_mint,
+		token_y_mint: poolTokenMints.token_y_mint,
+		phase: "before close",
+		getWalletBalances,
+		normalizeMint,
+		solMint: config.tokens.SOL,
+	});
   if (beforeCloseSnapshot?.error) {
     return {
       success: false,
@@ -1506,11 +885,14 @@ export async function rebalanceOnExit({
     });
   }
 
-  const afterCloseSnapshot = await captureBalanceSnapshotForMints({
-    token_x_mint: poolTokenMints.token_x_mint,
-    token_y_mint: poolTokenMints.token_y_mint,
-    phase: "after close",
-  });
+	const afterCloseSnapshot = await captureBalanceSnapshotForMints({
+		token_x_mint: poolTokenMints.token_x_mint,
+		token_y_mint: poolTokenMints.token_y_mint,
+		phase: "after close",
+		getWalletBalances,
+		normalizeMint,
+		solMint: config.tokens.SOL,
+	});
   if (afterCloseSnapshot?.error) {
     return {
       success: false,
@@ -1578,6 +960,7 @@ export async function rebalanceOnExit({
     amount_x: recoveredDeltaPlan.amount_x,
     amount_y: recoveredDeltaPlan.amount_y,
     decision_context,
+    bypass_portfolio_guard: true,
   };
   const deployResult = await deployPosition(deployArgs);
 
@@ -1637,26 +1020,6 @@ export async function rebalanceOnExit({
   };
 }
 
-function resolveCompoundingBias(rangeLocation) {
-  if (rangeLocation.location === "near_upper" || rangeLocation.location === "out_above") {
-    return "quote_heavy";
-  }
-  if (rangeLocation.location === "near_lower" || rangeLocation.location === "out_below") {
-    return "base_heavy";
-  }
-  return "balanced";
-}
-
-function normalizeCompoundingLocation(rangeLocation) {
-  if (rangeLocation.location === "near_upper" || rangeLocation.location === "out_above") {
-    return "near_upper";
-  }
-  if (rangeLocation.location === "near_lower" || rangeLocation.location === "out_below") {
-    return "near_lower";
-  }
-  return "near_center";
-}
-
 export async function autoCompoundFees({
   position_address,
   execute_reinvest = false,
@@ -1668,7 +1031,14 @@ export async function autoCompoundFees({
     return { success: false, error: "position_address is required" };
   }
 
-  const context = await getPositionExecutionContext(position_address);
+	const context = await getPositionExecutionContext(position_address, {
+		getMyPositions,
+		getPositionPnl,
+		buildTrackedFallback: (address) => buildTrackedPositionFallback(address, { getTrackedPosition }),
+		resolveBinSnapshot,
+		classifyRangeLocation,
+		isDryRun: process.env.DRY_RUN === "true",
+	});
   if (context.error) {
     return { success: false, error: context.error, position: position_address };
   }
@@ -1861,9 +1231,10 @@ export async function claimFees({ position_address }) {
     const pool = await getPool(poolAddress);
     const baseMint = pool.lbPair.tokenXMint.toString();
     const baseBalanceBeforeClaim = await getWalletTokenBalance({
-      walletPubkey: wallet.publicKey,
-      mint: baseMint,
-    }).catch(() => null);
+			walletPubkey: wallet.publicKey,
+			mint: baseMint,
+			getConnection,
+		}).catch(() => null);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
     const txs = await pool.claimSwapFee({
@@ -1884,9 +1255,10 @@ export async function claimFees({ position_address }) {
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
     const baseBalanceAfterClaim = await getWalletTokenBalance({
-      walletPubkey: wallet.publicKey,
-      mint: baseMint,
-    }).catch(() => null);
+			walletPubkey: wallet.publicKey,
+			mint: baseMint,
+			getConnection,
+		}).catch(() => null);
     const baseAmountReceived = computeObservedTokenDelta({
       previousBalance: baseBalanceBeforeClaim,
       observedBalance: baseBalanceAfterClaim,
@@ -1925,9 +1297,10 @@ export async function closePosition({ position_address, reason = "agent decision
     const pool = await getPool(poolAddress);
     const baseMint = pool.lbPair.tokenXMint.toString();
     const baseBalanceBeforeClose = await getWalletTokenBalance({
-      walletPubkey: wallet.publicKey,
-      mint: baseMint,
-    }).catch(() => null);
+			walletPubkey: wallet.publicKey,
+			mint: baseMint,
+			getConnection,
+		}).catch(() => null);
 
     const positionPubKey = new PublicKey(position_address);
 
@@ -1973,6 +1346,9 @@ export async function closePosition({ position_address, reason = "agent decision
       baseMint,
       positionAddress: position_address,
       previousBaseBalance: baseBalanceBeforeClose,
+			getConnection,
+			getMyPositions,
+			log,
     });
     if (!settlement.settled) {
       log("close_warn", `Post-close settlement not observed before timeout (${settlement.reason})`);
@@ -2035,60 +1411,6 @@ export async function closePosition({ position_address, reason = "agent decision
   }
 }
 
-function buildClosePerformancePayload({
-  tracked,
-  cachedPosition,
-  poolAddress,
-  pool,
-  positionAddress,
-  minutesHeld,
-  minutesOutOfRange,
-  reason,
-  decisionContext,
-} = {}) {
-  const pnlUsd = cachedPosition?.pnl_usd ?? 0;
-  const pnlPct = cachedPosition?.pnl_pct ?? 0;
-  const finalValueUsd = cachedPosition?.total_value_usd ?? 0;
-  const feesUsd = cachedPosition
-    ? (cachedPosition.collected_fees_usd || 0) + (cachedPosition.unclaimed_fees_usd || 0)
-    : tracked.total_fees_claimed_usd || 0;
-
-  return {
-    performance: {
-      position: positionAddress,
-      pool: poolAddress,
-      pool_name: tracked.pool_name || poolAddress.slice(0, 8),
-      strategy: tracked.strategy,
-      bin_range: tracked.bin_range,
-      bin_step: tracked.bin_step || null,
-      volatility: tracked.volatility || null,
-      fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-      organic_score: tracked.organic_score || null,
-      amount_sol: tracked.amount_sol,
-      base_mint: tracked.base_mint || pool.lbPair.tokenXMint.toString(),
-      fees_earned_usd: feesUsd,
-      final_value_usd: finalValueUsd,
-      initial_value_usd: tracked.initial_value_usd || 0,
-      minutes_in_range: Math.max(0, (minutesHeld || 0) - (minutesOutOfRange || 0)),
-      minutes_held: minutesHeld || 0,
-      claim_count: tracked.claim_count || 0,
-      rebalance_count: tracked.rebalance_count || 0,
-      close_reason: reason,
-      regime_label: tracked.regime_label || null,
-      opened_by_cycle_id: tracked.opened_by_cycle_id || null,
-      opened_by_action_id: tracked.opened_by_action_id || null,
-      opened_by_workflow_id: tracked.opened_by_workflow_id || null,
-      closed_by_cycle_id: decisionContext?.cycle_id || null,
-      closed_by_action_id: decisionContext?.action_id || null,
-      closed_by_workflow_id: decisionContext?.workflow_id || null,
-    },
-    result: {
-      pnl_usd: pnlUsd,
-      pnl_pct: pnlPct,
-    },
-  };
-}
-
 // ─── Helpers ──────────────────────────────────────────────────
 async function lookupPoolForPosition(position_address, walletAddress) {
   // Check state registry first (fast path)
@@ -2115,111 +1437,4 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   throw new Error(`Position ${position_address} not found in open positions`);
 }
 
-export function evaluatePostCloseSettlementObservation({
-	previousBaseBalance,
-	observedBaseBalance,
-	positionStillOpen,
-}) {
-	const observedBalanceDelta = computeObservedTokenDelta({
-		previousBalance: previousBaseBalance,
-		observedBalance: observedBaseBalance,
-	});
-
-  if (Number.isFinite(observedBalanceDelta) && observedBalanceDelta > 0) {
-    return {
-      settled: true,
-      signal: "base_balance_delta_observed",
-      observed_balance: observedBaseBalance,
-      observed_balance_delta: observedBalanceDelta,
-    };
-  }
-
-  if (positionStillOpen === false) {
-    return {
-      settled: true,
-      signal: "position_absent_from_open_positions",
-      observed_balance: observedBaseBalance,
-      observed_balance_delta: observedBalanceDelta,
-    };
-  }
-
-  return {
-    settled: false,
-    reason: "settlement_signal_not_observed",
-  };
-}
-
-async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddress, previousBaseBalance = null, maxAttempts = 6, delayMs = 1000 }) {
-  if (!baseMint && !positionAddress) {
-    return { settled: false, reason: "missing_settlement_observation_targets" };
-  }
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    let observedBaseBalance = null;
-    let positionStillOpen = null;
-
-    try {
-      if (baseMint) {
-        const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(baseMint) });
-        observedBaseBalance = (response.value || []).reduce((sum, account) => {
-          const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
-          return sum + (Number.isFinite(amount) ? amount : 0);
-        }, 0);
-      }
-    } catch (error) {
-      log("close_warn", `Settlement check attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
-    }
-
-    try {
-      if (positionAddress) {
-        const openPositions = await getMyPositions({ force: true });
-        if (!openPositions?.error && Array.isArray(openPositions?.positions)) {
-          positionStillOpen = openPositions.positions.some((position) => position.position === positionAddress);
-        }
-      }
-    } catch (error) {
-      log("close_warn", `Settlement open-position check ${attempt}/${maxAttempts} failed: ${error.message}`);
-    }
-
-    const observed = evaluatePostCloseSettlementObservation({
-      previousBaseBalance,
-      observedBaseBalance,
-      positionStillOpen,
-    });
-    if (observed.settled) {
-		return {
-			settled: true,
-			signal: observed.signal,
-			observed_balance: observed.observed_balance ?? null,
-			observed_balance_delta: observed.observed_balance_delta ?? null,
-			position_still_open: positionStillOpen,
-			attempts: attempt,
-		};
-    }
-
-    if (attempt < maxAttempts) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-
-  return { settled: false, reason: "settlement_signal_not_observed" };
-}
-
-function computeObservedTokenDelta({ previousBalance = null, observedBalance = null } = {}) {
-  const previous = Number(previousBalance);
-  const observed = Number(observedBalance);
-  if (!Number.isFinite(previous) || !Number.isFinite(observed)) {
-    return null;
-  }
-  const delta = observed - previous;
-  return delta > 0 ? delta : 0;
-}
-
-async function getWalletTokenBalance({ walletPubkey, mint } = {}) {
-  if (!walletPubkey || !mint) return null;
-  const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(mint) });
-  return (response.value || []).reduce((sum, account) => {
-    const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
-    return sum + (Number.isFinite(amount) ? amount : 0);
-  }, 0);
-}
+export { evaluatePostCloseSettlementObservation };

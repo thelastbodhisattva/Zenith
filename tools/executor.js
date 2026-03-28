@@ -18,12 +18,19 @@ import {
 import { log, logAction } from "../logger.js";
 import { recallMemory, rememberFact } from "../memory.js";
 import {
+	consumeOneShotGeneralWriteApproval,
+	evaluateGeneralWriteApproval,
+} from "../operator-controls.js";
+import { evaluatePortfolioGuard } from "../portfolio-guards.js";
+import { validateRecordedRiskOpeningPreflight } from "../preflight.js";
+import {
 	addPoolNote,
 	getPoolDeployCooldown,
 	getPoolMemory,
 } from "../pool-memory.js";
-import { evaluatePortfolioGuard } from "../portfolio-guards.js";
+import { buildOpenPositionPnlInputs } from "../runtime-helpers.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { getRuntimeHealth } from "../runtime-health.js";
 import { evaluateDeployAdmission } from "../runtime-policy.js";
 import {
 	addSmartWallet,
@@ -64,6 +71,15 @@ import {
 	rebalanceOnExit,
 	searchPools,
 } from "./dlmm.js";
+import {
+	appendWriteLifecycleEntry,
+	attachWriteDecisionContext,
+	recordWriteToolOutcome,
+} from "./executor-lifecycle.js";
+import {
+	runSafetyChecksWithDeps,
+} from "./executor-safety.js";
+import { handleSuccessfulToolSideEffects } from "./executor-side-effects.js";
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
 import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
 import { getTokenHolders, getTokenInfo, getTokenNarrative } from "./token.js";
@@ -121,15 +137,6 @@ function getPoolGovernanceMetadataRuntime(args = {}) {
 	return executorTestOverrides.getPoolGovernanceMetadata
 		? executorTestOverrides.getPoolGovernanceMetadata(args)
 		: getPoolGovernanceMetadata(args);
-}
-
-function mergeOpenPositions(livePositions = [], trackedPositions = []) {
-	const merged = new Map();
-	for (const position of [...livePositions, ...trackedPositions]) {
-		if (!position?.position) continue;
-		merged.set(position.position, position);
-	}
-	return Array.from(merged.values());
 }
 
 function recordToolOutcomeRuntime(payload) {
@@ -455,181 +462,7 @@ const WRITE_TOOLS = new Set([
 	"close_position",
 	"swap_token",
 ]);
-
-function buildDecisionContext(meta = {}, workflowId) {
-	return {
-		cycle_id: meta.cycle_id || null,
-		cycle_type: meta.cycle_type || null,
-		action_id: meta.action_id || workflowId,
-		workflow_id: workflowId,
-		regime_label: meta.regime_label || null,
-	};
-}
-
-function attachWriteDecisionContext(args, meta = {}, workflowId) {
-	return {
-		...(args || {}),
-		decision_context: {
-			...(args?.decision_context || {}),
-			...buildDecisionContext(meta, workflowId),
-		},
-	};
-}
-
-function appendWriteLifecycleEntry({
-	workflowId,
-	lifecycle,
-	name,
-	args,
-	meta = {},
-	reason = null,
-}) {
-	if (!workflowId) return;
-	appendActionLifecycle({
-		workflow_id: workflowId,
-		lifecycle,
-		tool: name,
-		cycle_id: meta.cycle_id || null,
-		action_id: meta.action_id || null,
-		position_address: args?.position_address || null,
-		pool_address: args?.pool_address || null,
-		reason,
-	});
-}
-
-function recordWriteToolOutcome({
-	tool,
-	outcome,
-	reason = null,
-	args,
-	meta = {},
-	result = null,
-}) {
-	recordToolOutcomeRuntime({
-		tool,
-		outcome,
-		reason,
-		metadata: {
-			pool_address:
-				args?.pool_address || result?.pool_address || result?.pool || null,
-			position_address: args?.position_address || result?.position || null,
-			cycle_id: meta.cycle_id || null,
-			action_id: meta.action_id || null,
-			blocked_by_recovery:
-				outcome === "blocked" && Boolean(meta.blocked_by_recovery),
-		},
-	});
-}
-
-async function handleSuccessfulToolSideEffects(
-	name,
-	normalizedArgs,
-	result,
-	meta = {},
-	workflowId = null,
-) {
-	if (name === "swap_token" && result.tx) {
-		await notifySwap({
-			inputSymbol: normalizedArgs.input_mint?.slice(0, 8),
-			outputSymbol:
-				normalizedArgs.output_mint ===
-					"So11111111111111111111111111111111111111112" ||
-				normalizedArgs.output_mint === "SOL"
-					? "SOL"
-					: normalizedArgs.output_mint?.slice(0, 8),
-			amountIn: result.amount_in,
-			amountOut: result.amount_out,
-			tx: result.tx,
-		}).catch(() => {});
-		return;
-	}
-
-	if (name === "deploy_position") {
-		await notifyDeploy({
-			pair:
-				result.pool_name ||
-				normalizedArgs.pool_name ||
-				normalizedArgs.pool_address?.slice(0, 8),
-			amountSol: normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0,
-			position: result.position,
-			tx: result.txs?.[0] ?? result.tx,
-			priceRange: result.price_range,
-			binStep: result.bin_step,
-			baseFee: result.base_fee,
-		}).catch(() => {});
-		return;
-	}
-
-	if (name === "close_position") {
-		await notifyClose({
-			pair: result.pool_name || normalizedArgs.position_address?.slice(0, 8),
-			pnlUsd: result.pnl_usd ?? 0,
-			pnlPct: result.pnl_pct ?? 0,
-		}).catch(() => {});
-		const swapAmount = Number(result.base_amount_received ?? 0);
-		if (!normalizedArgs.skip_swap && result.base_mint && Number.isFinite(swapAmount) && swapAmount > 0) {
-			log(
-				"executor",
-				`Auto-swapping observed close proceeds ${swapAmount} of ${result.base_mint.slice(0, 8)} back to SOL`,
-			);
-			const autoSwapResult = await executeTool(
-				"swap_token",
-				{
-					input_mint: result.base_mint,
-					output_mint: "SOL",
-					amount: swapAmount,
-				},
-				{
-					cycle_id: meta.cycle_id || null,
-					cycle_type: meta.cycle_type || null,
-					regime_label: meta.regime_label || null,
-					action_id: workflowId ? `${workflowId}:auto_swap_close` : undefined,
-				},
-			);
-			if (autoSwapResult?.error || autoSwapResult?.blocked) {
-				log(
-					"executor_warn",
-					`Auto-swap after close did not complete: ${autoSwapResult.error || autoSwapResult.reason || "unknown error"}`,
-				);
-			}
-		}
-		return;
-	}
-
-	if (
-		name === "claim_fees" &&
-		config.management.autoSwapAfterClaim &&
-		result.base_mint
-	) {
-		const swapAmount = Number(result.base_amount_received ?? 0);
-		if (Number.isFinite(swapAmount) && swapAmount > 0) {
-			log(
-				"executor",
-				`Auto-swapping observed claimed proceeds ${swapAmount} of ${result.base_mint.slice(0, 8)} back to SOL`,
-			);
-			const autoSwapResult = await executeTool(
-				"swap_token",
-				{
-					input_mint: result.base_mint,
-					output_mint: "SOL",
-					amount: swapAmount,
-				},
-				{
-					cycle_id: meta.cycle_id || null,
-					cycle_type: meta.cycle_type || null,
-					regime_label: meta.regime_label || null,
-					action_id: workflowId ? `${workflowId}:auto_swap_claim` : undefined,
-				},
-			);
-			if (autoSwapResult?.error || autoSwapResult?.blocked) {
-				log(
-					"executor_warn",
-					`Auto-swap after claim did not complete: ${autoSwapResult.error || autoSwapResult.reason || "unknown error"}`,
-				);
-			}
-		}
-	}
-}
+const GENERAL_APPROVAL_REQUIRED_TOOLS = new Set([...WRITE_TOOLS, "update_config"]);
 
 /**
  * Execute a tool call with safety checks and logging.
@@ -641,6 +474,7 @@ export async function executeTool(name, args, meta = {}) {
 
 	function appendManualReviewTerminal(reason) {
 		appendWriteLifecycleEntry({
+			appendActionLifecycle,
 			workflowId,
 			lifecycle: "manual_review",
 			name,
@@ -678,6 +512,17 @@ export async function executeTool(name, args, meta = {}) {
 	}
 
 	// ─── Pre-execution safety checks ──────────
+	if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(name) && !WRITE_TOOLS.has(name)) {
+		const safetyCheck = await runSafetyChecks(name, normalizedArgs, meta);
+		if (!safetyCheck.pass) {
+			log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+			return {
+				blocked: true,
+				reason: safetyCheck.reason,
+			};
+		}
+	}
+
 	if (WRITE_TOOLS.has(name)) {
 		if (_autonomousWriteSuppressed) {
 			const reason =
@@ -710,6 +555,7 @@ export async function executeTool(name, args, meta = {}) {
 			workflowId,
 		);
 		appendWriteLifecycleEntry({
+			appendActionLifecycle,
 			workflowId,
 			lifecycle: "intent",
 			name,
@@ -724,11 +570,12 @@ export async function executeTool(name, args, meta = {}) {
 			};
 		}
 
-		const safetyCheck = await runSafetyChecks(name, normalizedArgs);
+		const safetyCheck = await runSafetyChecks(name, normalizedArgs, meta);
 		if (!safetyCheck.pass) {
 			log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
 			appendManualReviewTerminal("write_intent_blocked_by_safety_checks");
 			recordWriteToolOutcome({
+				recordToolOutcome: recordToolOutcomeRuntime,
 				tool: name,
 				outcome: "blocked",
 				reason: safetyCheck.reason,
@@ -761,6 +608,7 @@ export async function executeTool(name, args, meta = {}) {
 		if (success) {
 			if (WRITE_TOOLS.has(name)) {
 				appendWriteLifecycleEntry({
+					appendActionLifecycle,
 					workflowId,
 					lifecycle: "completed",
 					name,
@@ -777,6 +625,7 @@ export async function executeTool(name, args, meta = {}) {
 					meta,
 				});
 				recordWriteToolOutcome({
+					recordToolOutcome: recordToolOutcomeRuntime,
 					tool: name,
 					outcome: "success",
 					args: normalizedArgs,
@@ -784,19 +633,39 @@ export async function executeTool(name, args, meta = {}) {
 					result,
 				});
 			}
-		await handleSuccessfulToolSideEffects(
-			name,
-			normalizedArgs,
-			result,
-			meta,
-			workflowId,
-		);
-	}
+			await handleSuccessfulToolSideEffects({
+				name,
+				normalizedArgs,
+				result,
+				meta,
+				workflowId,
+				executeTool,
+				notifySwap,
+				notifyDeploy,
+				notifyClose,
+				log,
+				config,
+			});
+		if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(name)) {
+				consumeOneShotGeneralWriteApproval({
+					tool_name: name,
+					pool_address: normalizedArgs?.pool_address || null,
+					position_address: normalizedArgs?.position_address || result?.position || null,
+					amount_sol:
+						name === "deploy_position"
+							? normalizedArgs?.amount_y ?? normalizedArgs?.amount_sol ?? 0
+							: name === "swap_token" && (normalizedArgs?.output_mint === "SOL" || normalizedArgs?.input_mint === "SOL")
+								? Number(normalizedArgs?.amount || 0)
+								: null,
+				});
+			}
+		}
 
 		if (!success && WRITE_TOOLS.has(name)) {
 			const reason = result?.error || "write_tool_reported_unsuccessful_result";
 			appendManualReviewTerminal(reason);
 			recordWriteToolOutcome({
+				recordToolOutcome: recordToolOutcomeRuntime,
 				tool: name,
 				outcome: "error",
 				reason,
@@ -813,6 +682,7 @@ export async function executeTool(name, args, meta = {}) {
 		if (WRITE_TOOLS.has(name)) {
 			appendManualReviewTerminal(error.message || "write_tool_execution_error");
 			recordWriteToolOutcome({
+				recordToolOutcome: recordToolOutcomeRuntime,
 				tool: name,
 				outcome: "error",
 				reason: error.message,
@@ -842,102 +712,22 @@ export async function executeTool(name, args, meta = {}) {
 /**
  * Run safety checks before executing write operations.
  */
-export async function runSafetyChecks(name, args) {
-		switch (name) {
-		case "deploy_position": {
-			const portfolioGuard = evaluatePortfolioGuard();
-			if (args?.pool_address) {
-				const governanceMetadata = await getPoolGovernanceMetadataRuntime({
-					pool_address: args.pool_address,
-				});
-				if (governanceMetadata?.error) {
-					return {
-						pass: false,
-						reason: `Deploy governance metadata unavailable: ${governanceMetadata.error}`,
-					};
-				}
-				args.base_mint = governanceMetadata.base_mint;
-				args.bin_step = governanceMetadata.bin_step;
-			}
-			const positions = await getMyPositionsRuntime({ force: true });
-			const trackedPositions = getTrackedPositions(true);
-				const combinedPositions = mergeOpenPositions(
-					positions.positions,
-					trackedPositions,
-				);
-				const balance = await getWalletBalancesRuntime();
-				const deployAdmission = evaluateDeployAdmission({
-					config,
-					poolAddress: args.pool_address,
-					baseMint: args.base_mint,
-					amountY: args.amount_y ?? args.amount_sol ?? 0,
-					amountX: args.amount_x ?? 0,
-					binStep: args.bin_step,
-					positions: combinedPositions,
-					positionsCount: combinedPositions.length,
-					walletSol: balance.sol,
-					portfolioGuard,
-					poolCooldown: getPoolDeployCooldown({
-					pool_address: args.pool_address,
-				}),
-			});
-
-			return deployAdmission.pass
-				? { pass: true }
-				: { pass: false, reason: deployAdmission.message };
-		}
-
-		case "swap_token": {
-			// Basic check — prevent swapping when DRY_RUN is true
-			// (handled inside swapToken itself, but belt-and-suspenders)
-			return { pass: true };
-		}
-
-		case "rebalance_on_exit":
-		case "auto_compound_fees": {
-			const portfolioGuard = evaluatePortfolioGuard();
-			if (portfolioGuard.blocked) {
-				return {
-					pass: false,
-					reason: `Portfolio guard active: ${portfolioGuard.reason}`,
-				};
-			}
-
-			if (!args?.position_address) {
-				return {
-					pass: false,
-					reason: "position_address is required.",
-				};
-			}
-			return { pass: true };
-		}
-
-		case "claim_fees":
-		case "close_position": {
-			if (!args?.position_address) {
-				return {
-					pass: false,
-					reason: "position_address is required.",
-				};
-			}
-
-			const positions = await getMyPositionsRuntime({ force: true });
-			const openPosition = positions.positions?.find(
-				(position) => position.position === args.position_address,
-			);
-			if (!openPosition) {
-				return {
-					pass: false,
-					reason: `Position ${args.position_address} is not currently open.`,
-				};
-			}
-
-			return { pass: true };
-		}
-
-		default:
-			return { pass: true };
-	}
+export async function runSafetyChecks(name, args, meta = {}) {
+	return runSafetyChecksWithDeps(name, args, meta, {
+		generalApprovalRequiredTools: GENERAL_APPROVAL_REQUIRED_TOOLS,
+		evaluateGeneralWriteApproval,
+		validateRecordedRiskOpeningPreflight,
+		getRuntimeHealth,
+		getWalletBalancesRuntime,
+		getPoolGovernanceMetadataRuntime,
+		getMyPositionsRuntime,
+		evaluatePortfolioGuard,
+		buildOpenPositionPnlInputs,
+		getTrackedPositions,
+		evaluateDeployAdmission,
+		getPoolDeployCooldown,
+		config,
+	});
 }
 
 /**

@@ -8,6 +8,7 @@ import {
 	appendReplayEnvelope,
 	createActionId,
 	createCycleId,
+	readReplayEnvelopeReport,
 	readReplayEnvelopes,
 } from "./cycle-trace.js";
 
@@ -53,6 +54,25 @@ test("cycle trace fails loudly on malformed replay lines", () => {
 		fs.mkdirSync(logDir, { recursive: true });
 		fs.writeFileSync(path.join(logDir, "replay-2026-03-27.jsonl"), "{bad json\n");
 		assert.throws(() => readReplayEnvelopes(), /invalid replay envelope/i);
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("cycle trace can report parse errors without dropping valid envelopes", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-trace-parse-report-test-"));
+
+	try {
+		process.chdir(tempDir);
+		const logDir = path.join(tempDir, "logs");
+		fs.mkdirSync(logDir, { recursive: true });
+		fs.writeFileSync(path.join(logDir, "replay-2026-03-27.jsonl"), `${JSON.stringify({ cycle_id: "ok-1", cycle_type: "screening" })}\n{bad json\n`);
+		const report = readReplayEnvelopeReport();
+		assert.equal(report.envelopes.length, 1);
+		assert.equal(report.envelopes[0].cycle_id, "ok-1");
+		assert.equal(report.parse_errors.length, 1);
 	} finally {
 		process.chdir(originalCwd);
 		fs.rmSync(tempDir, { recursive: true, force: true });

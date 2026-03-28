@@ -6,7 +6,13 @@ import { getMyPositions, getPositionPnl } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { discoverPools, getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, secretHealth } from "./config.js";
-import { evolveThresholds, getPerformanceHistory, getPerformanceSummary, getStrategyProofSummary } from "./lessons.js";
+import {
+	evolveThresholds,
+	getPerformanceHistory,
+	getPerformanceSummary,
+	getStrategyProofSummary,
+	recoverThresholdRolloutState,
+} from "./lessons.js";
 import { getScreeningThresholdSummary } from "./runtime-helpers.js";
 import { executeTool, getAutonomousWriteSuppression, registerCronRestarter, setAutonomousWriteSuppression } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
@@ -31,6 +37,7 @@ import {
 	summarizeRecoveryBlock,
 } from "./boot-recovery.js";
 import { getOverlappingCycleType, shouldTriggerFollowOnScreening } from "./cycle-overlap.js";
+import { handleCycleOverlap } from "./cycle-harness.js";
 import { clearPortfolioGuardPause, evaluatePortfolioGuard } from "./portfolio-guards.js";
 import { acknowledgeRecoveryResume, armGeneralWriteTools, disarmGeneralWriteTools, getOperatorControlSnapshot } from "./operator-controls.js";
 import { updateRuntimeHealth } from "./runtime-health.js";
@@ -45,6 +52,7 @@ import {
   buildOperationalHealthReport,
   buildProviderHealthFromSnapshot,
   buildStaticProviderHealth,
+  createHeadlessTelegramCommandHandler,
   createRuntimeHealthRefresher,
   formatActionJournalReport,
   formatEvidenceBundle,
@@ -82,6 +90,13 @@ log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
 
 initMemory();
+
+const thresholdRolloutRecovery = recoverThresholdRolloutState(config, {
+	trigger: "startup",
+});
+if (thresholdRolloutRecovery?.status && thresholdRolloutRecovery.status !== "clear") {
+	log("evolve_recovery", `Threshold rollout recovery status: ${thresholdRolloutRecovery.status}`);
+}
 
 const refreshRuntimeHealth = createRuntimeHealthRefresher({
   updateRuntimeHealth,
@@ -319,42 +334,23 @@ export function startCronJobs() {
       screeningBusy: _screeningBusy,
     });
 		if (overlapWith) {
-			const cycleId = createCycleId("management");
-			log("cron", `Management skipped due to overlap with ${overlapWith} cycle`);
-			appendReplayEnvelope({
-				cycle_id: cycleId,
-				cycle_type: "management",
-				status: "skipped_overlap",
-				summary: {
-					overlap_with: overlapWith,
-				},
-				overlap_inputs: {
+			handleCycleOverlap({
+				cycleType: "management",
+				overlapWith,
+				createCycleId,
+				log,
+				appendReplayEnvelope,
+				recordCycleEvaluation,
+				refreshRuntimeHealth,
+				listActionJournalWorkflowsByCycle,
+				overlapInputs: {
 					cycleType: "management",
 					managementBusy: _managementBusy,
 					screeningBusy: _screeningBusy,
 				},
-				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
 			});
-			recordCycleEvaluation({
-				cycle_id: cycleId,
-        cycle_type: "management",
-        status: "skipped_overlap",
-        summary: {
-          overlap_with: overlapWith,
-        },
-        positions: [],
-      });
-      refreshRuntimeHealth({
-        cycles: {
-          management: {
-            status: "skipped_overlap",
-            reason: overlapWith,
-            at: new Date().toISOString(),
-          },
-        },
-      });
-      return;
-    }
+			return;
+		}
     const cycleId = createCycleId("management");
     await runManagementCycle({ cycleId, screeningCooldownMs });
   });
@@ -366,42 +362,23 @@ export function startCronJobs() {
       screeningBusy: _screeningBusy,
     });
 		if (overlapWith) {
-			const cycleId = createCycleId("screening");
-			log("cron", `Screening skipped due to overlap with ${overlapWith} cycle`);
-			appendReplayEnvelope({
-				cycle_id: cycleId,
-				cycle_type: "screening",
-				status: "skipped_overlap",
-				summary: {
-					overlap_with: overlapWith,
-				},
-				overlap_inputs: {
+			handleCycleOverlap({
+				cycleType: "screening",
+				overlapWith,
+				createCycleId,
+				log,
+				appendReplayEnvelope,
+				recordCycleEvaluation,
+				refreshRuntimeHealth,
+				listActionJournalWorkflowsByCycle,
+				overlapInputs: {
 					cycleType: "screening",
 					managementBusy: _managementBusy,
 					screeningBusy: _screeningBusy,
 				},
-				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
 			});
-			recordCycleEvaluation({
-				cycle_id: cycleId,
-        cycle_type: "screening",
-        status: "skipped_overlap",
-        summary: {
-          overlap_with: overlapWith,
-        },
-        candidates: [],
-      });
-      refreshRuntimeHealth({
-        cycles: {
-          screening: {
-            status: "skipped_overlap",
-            reason: overlapWith,
-            at: new Date().toISOString(),
-          },
-        },
-      });
-      return;
-    }
+			return;
+		}
     const cycleId = createCycleId("screening");
     await runScreeningCycle({ cycleId });
   };
@@ -540,6 +517,38 @@ if (isTTY) {
     deployAmountSol: DEPLOY,
   });
 } else {
+  const onHeadlessTelegramMessage = createHeadlessTelegramCommandHandler({
+		handleOperatorCommandText: async ({ text, source }) => handleOperatorCommandText({
+			text,
+			source,
+			config,
+			getRecoveryWorkflowReport,
+			getAutonomousWriteSuppression,
+			setAutonomousWriteSuppression,
+			acknowledgeRecoveryResume,
+			armGeneralWriteTools,
+			disarmGeneralWriteTools,
+			getOperatorControlSnapshot,
+			refreshRuntimeHealth,
+		}),
+		buildOperationalHealthReport: async () => buildOperationalHealthReport({
+			getStartupSnapshot,
+			getWalletBalances,
+			getMyPositions,
+			getTopCandidates,
+			isFailClosedResult,
+			buildStaticProviderHealth,
+			buildProviderHealthFromSnapshot,
+			refreshRuntimeHealth,
+			getOperatorControlSnapshot,
+			secretHealth,
+			telegramEnabled,
+		}),
+		getRecoveryWorkflowReport,
+		getAutonomousWriteSuppression,
+		formatRecoveryReport,
+		sendMessage,
+	});
   await runNonInteractiveStartup({
     bootRecoveryBlockActive,
     bootRecovery,
@@ -547,8 +556,7 @@ if (isTTY) {
     log,
     startCronJobs,
     maybeRunMissedBriefing,
-    agentLoop,
-    config,
-    deployAmountSol: DEPLOY,
+		startPolling,
+		onTelegramMessage: onHeadlessTelegramMessage,
   });
 }

@@ -1,3 +1,59 @@
+function parseArmScopeOptions(parts = []) {
+	const scope = {};
+	const reasonParts = [];
+	for (const part of parts) {
+		if (!part) continue;
+		if (part === "once") {
+			scope.one_shot = true;
+			continue;
+		}
+		const [key, ...valueParts] = part.split("=");
+		if (!valueParts.length) {
+			reasonParts.push(part);
+			continue;
+		}
+		const value = valueParts.join("=");
+		if (key === "tool" || key === "tools") {
+			scope.allowed_tools = value.split(",").map((tool) => tool.trim()).filter(Boolean);
+			continue;
+		}
+		if (key === "pool") {
+			scope.pool_address = value;
+			continue;
+		}
+		if (key === "position") {
+			scope.position_address = value;
+			continue;
+		}
+		if (key === "max_sol" || key === "amount_sol") {
+			scope.max_amount_sol = Number(value);
+			continue;
+		}
+		if (key === "one_shot") {
+			scope.one_shot = value === "true" || value === "1";
+			continue;
+		}
+		reasonParts.push(part);
+	}
+	return {
+		scope,
+		reason: reasonParts.join(" "),
+	};
+}
+
+function formatApprovalScope(scope = null) {
+	if (!scope) return "general scope";
+	const parts = [];
+	if (Array.isArray(scope.allowed_tools) && scope.allowed_tools.length > 0) {
+		parts.push(`tools=${scope.allowed_tools.join(",")}`);
+	}
+	if (scope.pool_address) parts.push(`pool=${scope.pool_address}`);
+	if (scope.position_address) parts.push(`position=${scope.position_address}`);
+	if (scope.max_amount_sol != null) parts.push(`max_sol=${scope.max_amount_sol}`);
+	if (scope.one_shot) parts.push("once");
+	return parts.length > 0 ? parts.join(" ") : "general scope";
+}
+
 export async function handleOperatorCommandText({
   text,
   source,
@@ -16,13 +72,20 @@ export async function handleOperatorCommandText({
   if (text.startsWith("/arm")) {
     const [, minutesRaw, ...reasonParts] = text.split(/\s+/);
     const minutes = Math.max(1, Number(minutesRaw) || 10);
-    const reason = reasonParts.join(" ") || `${source} operator arm`;
-    const armStatus = armGeneralWriteTools({ minutes, reason });
+    const parsed = parseArmScopeOptions(reasonParts);
+    if (!Array.isArray(parsed.scope.allowed_tools) || parsed.scope.allowed_tools.length === 0) {
+			return {
+				handled: true,
+				message: "Scoped approvals require at least one explicit tool via tool=<name>.",
+			};
+		}
+    const reason = parsed.reason || `${source} operator arm`;
+    const armStatus = armGeneralWriteTools({ minutes, reason, scope: parsed.scope });
     const snapshot = getOperatorControlSnapshot?.() || { general_write_arm: armStatus };
     refreshRuntimeHealth();
     return {
       handled: true,
-      message: `GENERAL write tools armed for ${minutes} minute(s)${snapshot.general_write_arm?.armed_until ? ` until ${snapshot.general_write_arm.armed_until}` : ""}.`,
+      message: `GENERAL write tools armed for ${minutes} minute(s)${snapshot.general_write_arm?.armed_until ? ` until ${snapshot.general_write_arm.armed_until}` : ""} with ${formatApprovalScope(snapshot.general_write_arm?.scope)}.`,
     };
   }
 

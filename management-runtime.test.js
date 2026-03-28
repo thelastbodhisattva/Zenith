@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { resetSlowManagementReviewForTests } from "./management-review-window.js";
 import { runManagementRuntimeActions } from "./management-runtime.js";
 
 const config = {
@@ -9,8 +10,13 @@ const config = {
     takeProfitFeePct: 5,
     minFeePerTvl24h: 7,
     minClaimAmount: 5,
+    slowReviewIntervalMin: 15,
   },
 };
+
+test.afterEach(() => {
+	resetSlowManagementReviewForTests();
+});
 
 test("runManagementRuntimeActions only executes deterministic runtime actions", async () => {
   const calls = [];
@@ -110,4 +116,81 @@ test("runManagementRuntimeActions closes parsed instruction thresholds without e
   assert.equal(calls[0].args.position_address, "pos-inst-close");
   assert.equal(results.length, 1);
   assert.equal(results[0].position, "pos-inst-close");
+});
+
+test("runManagementRuntimeActions keeps fee and low-yield reviews in the slow pass", async () => {
+	const calls = [];
+	const results = await runManagementRuntimeActions([
+		{
+			position: "pos-fast",
+			pair: "Alpha-SOL",
+			in_range: false,
+			minutes_out_of_range: 8,
+			pnl: { volatility: 6 },
+		},
+		{
+			position: "pos-slow",
+			pair: "Beta-SOL",
+			in_range: true,
+			age_minutes: 120,
+			pnl: { fee_per_tvl_24h: 3, unclaimed_fee_usd: 6 },
+			unclaimed_fees_usd: 6,
+		},
+	], {
+		cycleId: "management-split",
+		config,
+		nowMs: Date.parse("2030-01-01T00:00:00.000Z"),
+		executeTool: async (name, args, meta) => {
+			calls.push({ name, args, meta });
+			return { success: true, tool: name };
+		},
+	});
+
+	assert.equal(calls.length, 2);
+	assert.equal(calls[0].name, "rebalance_on_exit");
+	assert.equal(calls[1].name, "close_position");
+	assert.equal(results[1].position, "pos-slow");
+});
+
+test("runManagementRuntimeActions skips slow review actions until the interval elapses", async () => {
+	const calls = [];
+	await runManagementRuntimeActions([
+		{
+			position: "pos-slow-1",
+			pair: "Beta-SOL",
+			in_range: true,
+			age_minutes: 120,
+			pnl: { fee_per_tvl_24h: 3, unclaimed_fee_usd: 6 },
+			unclaimed_fees_usd: 6,
+		},
+	], {
+		cycleId: "management-slow-1",
+		config,
+		nowMs: Date.parse("2030-01-01T00:00:00.000Z"),
+		executeTool: async (name, args, meta) => {
+			calls.push({ name, args, meta });
+			return { success: true, tool: name };
+		},
+	});
+	await runManagementRuntimeActions([
+		{
+			position: "pos-slow-2",
+			pair: "Gamma-SOL",
+			in_range: true,
+			age_minutes: 120,
+			pnl: { fee_per_tvl_24h: 3, unclaimed_fee_usd: 6 },
+			unclaimed_fees_usd: 6,
+		},
+	], {
+		cycleId: "management-slow-2",
+		config,
+		nowMs: Date.parse("2030-01-01T00:05:00.000Z"),
+		executeTool: async (name, args, meta) => {
+			calls.push({ name, args, meta });
+			return { success: true, tool: name };
+		},
+	});
+
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].name, "close_position");
 });

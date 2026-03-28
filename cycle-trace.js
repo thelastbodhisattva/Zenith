@@ -20,28 +20,42 @@ export function appendReplayEnvelope(envelope) {
 	appendJsonlRecordSync(file, { timestamp, ...envelope });
 }
 
-export function readReplayEnvelopes() {
-  if (!fs.existsSync(TRACE_DIR)) return [];
-  const files = fs.readdirSync(TRACE_DIR)
-    .filter((file) => /^replay-.*\.jsonl$/.test(file))
-    .sort();
-  const envelopes = [];
+export function readReplayEnvelopeReport() {
+	if (!fs.existsSync(TRACE_DIR)) return { envelopes: [], parse_errors: [] };
+	const files = fs.readdirSync(TRACE_DIR)
+		.filter((file) => /^replay-.*\.jsonl$/.test(file))
+		.sort();
+	const envelopes = [];
+	const parse_errors = [];
 
 	for (const file of files) {
 		const fullPath = path.join(TRACE_DIR, file);
 		const lines = fs.readFileSync(fullPath, "utf8").split(/\r?\n/).filter(Boolean);
-		for (const line of lines) {
+		for (let index = 0; index < lines.length; index += 1) {
 			try {
-				envelopes.push(JSON.parse(line));
+				envelopes.push(JSON.parse(lines[index]));
 			} catch (error) {
-				throw new Error(`Invalid replay envelope in ${file}: ${error.message}`);
+				parse_errors.push({
+					file,
+					line: index + 1,
+					error: error.message,
+				});
 			}
 		}
 	}
 
-  return envelopes;
+	return { envelopes, parse_errors };
+}
+
+export function readReplayEnvelopes() {
+	const report = readReplayEnvelopeReport();
+	if (report.parse_errors.length > 0) {
+		const first = report.parse_errors[0];
+		throw new Error(`Invalid replay envelope in ${first.file}:${first.line}: ${first.error}`);
+	}
+	return report.envelopes;
 }
 
 export function getReplayEnvelope(cycleId) {
-  return readReplayEnvelopes().find((envelope) => envelope.cycle_id === cycleId) || null;
+	return readReplayEnvelopeReport().envelopes.find((envelope) => envelope.cycle_id === cycleId) || null;
 }

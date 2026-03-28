@@ -1,3 +1,5 @@
+import { finalizeCycleRun } from "./cycle-harness.js";
+
 export function createManagementCycleRunner(deps) {
   return async function runManagementCycle({ cycleId, screeningCooldownMs } = {}) {
     const {
@@ -350,25 +352,24 @@ REPORT FORMAT (one per position):
         written_at: new Date().toISOString(),
       });
     } finally {
-      if (managementEvaluation) recordCycleEvaluation(managementEvaluation);
       setManagementBusy(false);
       if (triggerFollowOnScreening) {
         runTriggeredScreening().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       }
-      refreshRuntimeHealth({
-        cycles: {
-          management: {
-            status: managementEvaluation?.status || "completed",
-            reason: managementEvaluation?.summary?.reason_code || null,
-            at: new Date().toISOString(),
-          },
-        },
-      });
-      if (telegramEnabled()) {
-        if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${mgmtReport}`).catch(() => {});
-        for (const p of positions) {
-          if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-            notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
+			finalizeCycleRun({
+				cycleType: "management",
+				evaluation: managementEvaluation,
+				recordCycleEvaluation,
+				refreshRuntimeHealth,
+				telegramEnabled,
+				sendMessage,
+				telegramPrefix: "🔄 Management Cycle",
+				report: mgmtReport,
+			});
+		if (telegramEnabled()) {
+			for (const p of positions) {
+				if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
+					notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
           }
         }
       }

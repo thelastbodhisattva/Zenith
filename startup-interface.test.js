@@ -7,6 +7,7 @@ test("non-interactive startup no longer launches an autonomous startup deploy lo
 	let cronStarted = 0;
 	let briefingAttempts = 0;
 	let agentCalls = 0;
+	let pollingStarts = 0;
 
 	await runNonInteractiveStartup({
 		bootRecoveryBlockActive: false,
@@ -15,6 +16,9 @@ test("non-interactive startup no longer launches an autonomous startup deploy lo
 		log: () => {},
 		startCronJobs: () => {
 			cronStarted += 1;
+		},
+		startPolling: () => {
+			pollingStarts += 1;
 		},
 		maybeRunMissedBriefing: async () => {
 			briefingAttempts += 1;
@@ -30,4 +34,27 @@ test("non-interactive startup no longer launches an autonomous startup deploy lo
 	assert.equal(cronStarted, 1);
 	assert.equal(briefingAttempts, 1);
 	assert.equal(agentCalls, 0);
+	assert.equal(pollingStarts, 1);
+});
+
+test("non-interactive recovery-blocked startup still starts Telegram polling", async () => {
+	let pollingStarts = 0;
+	let cronStarted = 0;
+
+	await runNonInteractiveStartup({
+		bootRecoveryBlockActive: true,
+		bootRecovery: { reason_code: "UNRESOLVED_WORKFLOW" },
+		summarizeRecoveryBlock: () => ({ headline: "blocked", detail: "detail" }),
+		log: () => {},
+		startCronJobs: () => {
+			cronStarted += 1;
+		},
+		startPolling: () => {
+			pollingStarts += 1;
+		},
+		maybeRunMissedBriefing: async () => {},
+	});
+
+	assert.equal(pollingStarts, 1);
+	assert.equal(cronStarted, 0);
 });

@@ -12,14 +12,22 @@ test("general role is read-only unless dangerous tools are explicitly allowed", 
 	assert.equal(generalSafe.includes("add_lesson"), false);
 
 	const generalArmed = getToolsForRole("GENERAL", { allowDangerousTools: true }).map((tool) => tool.function.name);
-	assert.equal(generalArmed.includes("deploy_position"), true);
-	assert.equal(generalArmed.includes("update_config"), true);
+	assert.equal(generalArmed.includes("deploy_position"), false);
+	assert.equal(generalArmed.includes("update_config"), false);
 	assert.equal(generalArmed.includes("self_update"), false);
 
 	const screenerTools = getToolsForRole("SCREENER").map((tool) => tool.function.name);
 	const managerTools = getToolsForRole("MANAGER").map((tool) => tool.function.name);
 	assert.equal(screenerTools.includes("update_config"), false);
 	assert.equal(managerTools.includes("update_config"), false);
+
+	const generalScoped = getToolsForRole("GENERAL", {
+		allowDangerousTools: true,
+		dangerousToolScope: { allowed_tools: ["deploy_position"] },
+	}).map((tool) => tool.function.name);
+	assert.equal(generalScoped.includes("deploy_position"), true);
+	assert.equal(generalScoped.includes("close_position"), false);
+	assert.equal(generalScoped.includes("swap_token"), false);
 
 	const limited = limitToolCallsPerTurn([
 		{ id: "call-1", function: { name: "get_top_candidates", arguments: "{}" } },

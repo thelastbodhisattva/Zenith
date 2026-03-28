@@ -134,6 +134,7 @@ export function formatRecoveryWorkflowReport(report, suppression = { suppressed:
   const lines = ["", "Recovery report:", ""];
   lines.push(`  writes_suppressed: ${suppression.suppressed ? "yes" : "no"}${suppression.reason ? ` / ${suppression.reason}` : ""}`);
   lines.push(`  report_status: ${report.status}`);
+  if (report.incident_key) lines.push(`  incident_key: ${report.incident_key}`);
   lines.push(`  manual_review_workflows: ${report.total_manual_review_workflows}`);
   lines.push(`  unresolved_pending_workflows: ${report.total_unresolved_workflows}`);
 

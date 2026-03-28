@@ -26,6 +26,15 @@ export function getScreeningThresholdSummary(screening) {
   ];
 }
 
+export function buildOpenPositionPnlInputs(positions = []) {
+	return (Array.isArray(positions) ? positions : [])
+		.map((position) => ({
+			pnl_usd: position?.pnl_usd,
+			pnl_pct: position?.pnl_pct,
+		}))
+		.filter((position) => Number.isFinite(Number(position.pnl_usd)) || Number.isFinite(Number(position.pnl_pct)));
+}
+
 export function normalizeOptionalNonNegativeNumber(value, fallback = null) {
   if (value == null || value === "") return null;
   const num = Number(value);

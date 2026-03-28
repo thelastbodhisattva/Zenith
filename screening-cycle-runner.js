@@ -1,3 +1,7 @@
+import { finalizeCycleRun } from "./cycle-harness.js";
+
+import { buildOpenPositionPnlInputs } from "./runtime-helpers.js";
+
 export function createScreeningCycleRunner(deps) {
   return async function runScreeningCycle({ cycleId } = {}) {
     const {
@@ -95,6 +99,7 @@ export function createScreeningCycleRunner(deps) {
 
       const portfolioGuard = evaluatePortfolioGuard({
         portfolioSnapshot: preBalance,
+			openPositionPnls: buildOpenPositionPnlInputs(prePositions.positions),
       });
       const screeningAdmission = evaluateScreeningCycleAdmission({
         positionsCount: prePositions.total_positions,
@@ -564,20 +569,17 @@ STEPS:
         written_at: new Date().toISOString(),
       });
     } finally {
-      if (screeningEvaluation) recordCycleEvaluation(screeningEvaluation);
-      setScreeningBusy(false);
-      refreshRuntimeHealth({
-        cycles: {
-          screening: {
-            status: screeningEvaluation?.status || "completed",
-            reason: screeningEvaluation?.summary?.reason_code || null,
-            at: new Date().toISOString(),
-          },
-        },
-      });
-      if (telegramEnabled() && screenReport) {
-        sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
-      }
-    }
+			setScreeningBusy(false);
+			finalizeCycleRun({
+				cycleType: "screening",
+				evaluation: screeningEvaluation,
+				recordCycleEvaluation,
+				refreshRuntimeHealth,
+				telegramEnabled,
+				sendMessage,
+				telegramPrefix: "🔍 Screening Cycle",
+				report: screenReport,
+			});
+		}
   };
 }

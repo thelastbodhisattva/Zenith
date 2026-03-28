@@ -61,6 +61,7 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,
     trailingDropPct:       u.trailingDropPct       ?? 1.5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
+    slowReviewIntervalMin: u.slowReviewIntervalMin ?? 15,
     minSolToOpen:          getEffectiveMinSolToOpen({
       minSolToOpen: u.minSolToOpen ?? 0.55,
       deployAmountSol: u.deployAmountSol ?? 0.5,

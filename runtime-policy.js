@@ -460,7 +460,7 @@ export function evaluateDeployAdmission({
   };
 }
 
-export function planManagementRuntimeAction(position, config, expectedVolumeProfile = null) {
+export function planManagementRuntimeAction(position, config, expectedVolumeProfile = null, { phase = "all" } = {}) {
   const instructionGate = classifyInstructionRuntimeGate(position);
   if (instructionGate.action === "close") {
     return {
@@ -536,6 +536,10 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
       rule: MANAGEMENT_SUBREASONS.OUT_OF_RANGE,
     };
   }
+
+	if (phase === "fast") {
+		return null;
+	}
 
   if (feePerTvl24h != null && feePerTvl24h < config.management.minFeePerTvl24h && asNumber(position.age_minutes, 0) >= 60) {
     return {
