@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-28`
+Implementation status updated: `2026-03-29`
 
 ---
 
@@ -77,6 +77,11 @@ A third health check runs hourly to summarize portfolio state.
 - Threshold evolution is now rollout-based with automatic accept/rollback, so a bad auto-tune can revert instead of ratcheting forever
 - Deploy sizing now adapts under hard caps using regime, recent realized performance, and position-utilization context, while still respecting reserve/floor/ceiling rules
 - Negative memory now includes cross-pool regime cooldowns with sample-quality gating, and screening also records observational counterfactual review for alternate regime packs without executing them
+- Screening now fails closed before model invocation when startup readiness or regime-state persistence is invalid, and adaptive sizing skips new capital deployment when the resulting size falls below the required SOL floor after regime/cooldown adjustments
+- Manual risk-opening deploys now go through persisted `/preflight` checks: GENERAL write tools need explicit scoped `/arm` approval (`tool=...`, optional `pool=`, `position=`, `max_sol=`, `once`), recorded preflights must still match the intended deploy, and `/resume <why>` only clears the matching unresolved-workflow suppression incident without clearing portfolio guard pauses
+- Non-TTY startup is now cron-only; if `TELEGRAM_CHAT_ID` is configured, headless Telegram polling can still serve `/health`, `/recovery`, and operator commands even while autonomous writes remain recovery-blocked
+- Management now treats stale PnL as a review-only signal instead of a close/claim trigger, while deterministic out-of-range rebalances and other obvious runtime actions can still complete without waiting for the model
+- Prompt memory is now role-aware and narrower, so screening/management prompts reuse bounded lessons and broader strategy buckets without mixing every stored nugget into every agent context
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -218,6 +223,7 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/candidates` | Re-screen and display the current top candidates |
 | `/candidate <n>` | Inspect one ranked candidate with richer signals on demand |
 | `/health` | Show machine-readable heartbeat, provider health, suppression state, and guard status |
+| `/preflight [tool=<name>] [pool=<pool>] [position=<position>] [amount_sol=<n>]` | Run and persist a scoped risk-opening preflight for a manual write action |
 | `/evaluation` | Show recent cycle/tool evaluation summaries |
 | `/failures` | Show recent persisted bad-cycle evidence bundles |
 | `/failure <id>` | Show one persisted evidence bundle in detail |
@@ -226,7 +232,7 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/replay <cycle_id>` | Show one replay envelope |
 | `/reconcile <cycle_id>` | Re-run deterministic replay reconciliation for one cycle |
 | `/review` | Show replay-backed review stats across recent cycles |
-| `/resume <why>` | Clear current-process suppression only for unresolved-workflow manual-review blocks |
+| `/resume <why>` | Persist a bounded restart-aware override for the matching unresolved-workflow suppression incident |
 | `/arm <minutes> tool=<name>[,name] [pool=<pool>] [position=<position>] [max_sol=<n>] [once] [why]` | Temporarily arm scoped GENERAL write access |
 | `/disarm` | Remove GENERAL free-form write access |
 | `/performance` | Show recent closed-position attribution and history |
@@ -240,7 +246,7 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/stop` | Graceful shutdown |
 | `<anything else>` | Free-form chat for questions, actions, and pool analysis |
 
-Free-form chat keeps recent session history so you can continue the conversation naturally.
+Free-form chat keeps recent session history so you can continue the conversation naturally. GENERAL chat stays read-only unless you explicitly arm scoped write tools, and manual risk-opening deploys are expected to pass a fresh matching `/preflight` check.
 
 ---
 
@@ -406,6 +412,11 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `startup-snapshot.test.js` — provider-free startup snapshot cache/fail-closed validation checks
 - `management-runtime.test.js` — provider-free management runtime runner checks
 - `evidence-bundles.test.js` — persisted bad-cycle evidence bundle checks
+- `screening-cycle-runner.test.js` — fail-closed screening prechecks and invalid regime-state handling
+- `management-cycle-runner.test.js` — runtime-only management cycle completion without model calls
+- `dlmm-deploy-guard.test.js` — low-yield cooldown and bounded deploy/rebalance guardrails
+- `preflight.test.js` — `/preflight` report and recorded risk-opening validation
+- `operator-command-handlers.test.js` — scoped `/arm` parsing and durable `/resume` handling
 - `test/test-dry-run-startup.js` — provider-free dry-run startup verification for boot recovery + startup snapshot readiness
 - `test/test-operator-drill.js` — provider-free screening reconciliation and fail-closed evidence drill
 - `test/test-chaos-drill.js` — provider-free chaos drill for startup/provider failure, stale-PnL management, and bounded LP Agent fallback
@@ -414,9 +425,12 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `replay-review.test.js` — replay lookup and reconciliation review helpers
 - `operator-controls.test.js` — GENERAL write arming and operator audit logging
 - `agent-tools.test.js` — read-only GENERAL tool surface by default
+- `telegram.test.js` — polling stays disabled without `TELEGRAM_CHAT_ID`
+- `pool-memory.test.js` — low-yield cooldown persistence and corrupt-state fail-closed behavior
 - `regime-packs.test.js` — deterministic regime classification and pack application
 - `negative-regime-memory.test.js` — cross-pool negative regime cooldown persistence
 - `counterfactual-review.test.js` — observational counterfactual review persistence
+- `tools/study.test.js` — bounded LPAgent-disabled study fallback behavior
 
 Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 

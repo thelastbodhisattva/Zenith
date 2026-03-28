@@ -4,6 +4,18 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-29
+
+- Added explicit scoped GENERAL write approvals and persisted recovery resume overrides: `/arm` now requires `tool=...` scope and supports `pool=`, `position=`, `max_sol`, and `once`, while `/resume <why>` only clears the matching unresolved-workflow manual-review suppression incident and leaves portfolio guard pauses intact.
+- Added `/preflight` as a persisted risk-opening check for manual deploy actions, with recorded approval matching and stable validation/runbook reasons enforced at the executor boundary.
+- Hardened screening so startup-precheck failures and invalid regime-state persistence fail closed before model invocation, and adaptive sizing now skips new deployment when the resulting size falls below the required SOL floor.
+- Hardened management so deterministic runtime actions can complete a cycle without model help, stale PnL becomes a review-only signal instead of a close/claim trigger, and bounded out-of-range rebalance handling stays available.
+- Tightened deploy and rebalance guardrails with earlier low-yield pool cooldown blocking, fail-closed invalid memory/regime handling, and safer redeploy blocking when remaining open-risk cannot be determined.
+- Narrowed prompt and memory reuse with role-aware bounded lesson selection, broader strategy buckets, stronger evidence gating for negative-regime cooldowns, and cleaner realized attribution/proof summaries.
+- Changed non-interactive startup to cron-only mode, and kept headless Telegram operator access available only when `TELEGRAM_CHAT_ID` is configured for `/health`, `/recovery`, and operator commands.
+- Expanded direct regression coverage for scoped operator commands, `/preflight`, screening fail-closed prechecks, runtime-only management cycles, executor write boundaries, Telegram chat-id requirements, low-yield cooldown persistence, and LPAgent-disabled study fallbacks.
+- Updated `README.md` and `CHANGELOG.md` to reflect the stricter manual-write, fail-closed screening, and headless-operator contracts.
+
 ### 2026-03-28
 
 - Continued the architecture cleanup by shrinking `tools/dlmm.js` through dedicated `tools/dlmm-planner.js`, `tools/dlmm-settlement.js`, `tools/dlmm-rebalance-helpers.js`, and `tools/dlmm-position-context.js` seams while keeping the public DLMM tool surface stable.
