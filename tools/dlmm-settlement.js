@@ -1,5 +1,18 @@
 import { PublicKey } from "@solana/web3.js";
 
+export function sanitizeCloseReason(reason) {
+	const normalized = String(reason || "agent decision").trim().toLowerCase();
+	if (normalized.includes("stop loss")) return "stop_loss";
+	if (normalized.includes("trailing")) return "trailing_take_profit";
+	if (normalized.includes("take profit")) return "fixed_take_profit";
+	if (normalized.includes("rebalance")) return "rebalance";
+	if (normalized.includes("instruction")) return "instruction_rule";
+	if (normalized.includes("manual") || normalized.includes("operator")) return "manual_operator";
+	if (normalized.includes("fee yield")) return "fee_yield_too_low";
+	if (normalized.includes("volume")) return "volume_collapse";
+	return "agent_decision";
+}
+
 export function buildClosePerformancePayload({
 	tracked,
 	cachedPosition,
@@ -11,6 +24,7 @@ export function buildClosePerformancePayload({
 	reason,
 	decisionContext,
 } = {}) {
+	const safeCloseReason = sanitizeCloseReason(reason);
 	const pnlUsd = cachedPosition?.pnl_usd ?? 0;
 	const pnlPct = cachedPosition?.pnl_pct ?? 0;
 	const finalValueUsd = cachedPosition?.total_value_usd ?? 0;
@@ -38,7 +52,7 @@ export function buildClosePerformancePayload({
 			minutes_held: minutesHeld || 0,
 			claim_count: tracked.claim_count || 0,
 			rebalance_count: tracked.rebalance_count || 0,
-			close_reason: reason,
+			close_reason: safeCloseReason,
 			regime_label: tracked.regime_label || null,
 			opened_by_cycle_id: tracked.opened_by_cycle_id || null,
 			opened_by_action_id: tracked.opened_by_action_id || null,
@@ -50,6 +64,7 @@ export function buildClosePerformancePayload({
 		result: {
 			pnl_usd: pnlUsd,
 			pnl_pct: pnlPct,
+			close_reason: safeCloseReason,
 		},
 	};
 }

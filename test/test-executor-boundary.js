@@ -113,6 +113,21 @@ async function main() {
 	assert.equal(result.blocked, true);
 	assert.equal(updateConfigCalled, false);
 
+	result = await executeTool("remember_fact", {
+		nugget: "facts",
+		key: "test-memory",
+		value: "should not persist",
+	}, { cycle_id: "screening-test" });
+	assert.equal(result.blocked, true);
+	assert.match(result.reason, /autonomous memory mutation is disabled/i);
+
+	result = await executeTool("add_pool_note", {
+		pool_address: "pool-1",
+		note: "should not persist",
+	}, { cycle_id: "screening-test" });
+	assert.equal(result.blocked, true);
+	assert.match(result.reason, /autonomous note mutation is disabled/i);
+
   let receivedArgs = null;
 	setExecutorTestOverrides({
 		getMyPositions: async () => ({ total_positions: 0, positions: [] }),

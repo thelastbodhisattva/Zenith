@@ -245,25 +245,7 @@ export async function scoreTopLPers({ pool_address, limit = DEFAULT_SCORE_LIMIT 
     candidates: scored,
   };
 
-  try {
-    const { rememberWalletScores } = await import("../memory.js");
-    rememberWalletScores({
-      pool_address,
-      scored_wallets: scored,
-      scoring: {
-        model: result.scoring_model,
-        lpagent: result.source_status.lpagent,
-        dune: result.source_status.dune,
-      },
-      metadata: {
-        filters_applied: result.filters_applied,
-      },
-    });
-  } catch {
-    // best-effort only
-  }
-
-  return result;
+	return result;
 }
 
 function buildWalletScore(lper, positions, duneRow) {
@@ -512,23 +494,7 @@ export async function getPoolInfo({ pool_address }) {
     })),
   };
 
-  try {
-    const { rememberFact } = await import("../memory.js");
-    const pair = `${tokenX.symbol || "?"}-${tokenY.symbol || "SOL"}`;
-    const safety = [
-      tokenX.audit?.mintAuthorityDisabled ? "mint-off" : "MINT-ON",
-      tokenX.audit?.freezeAuthorityDisabled ? "freeze-off" : "FREEZE-ON",
-      `${(tokenX.audit?.botHoldersPercentage || 0).toFixed(0)}% bots`,
-      `${(tokenX.audit?.topHoldersPercentage || 0).toFixed(0)}% top holders`,
-      `organic ${(tokenX.organicScore || 0).toFixed(0)}`,
-      `${tokenX.holderCount || 0} holders`,
-    ].join(", ");
-    rememberFact("pools", `${pair}_audit`, safety);
-  } catch {
-    // best-effort only
-  }
-
-  return result;
+	return result;
 }
 
 function buildComponent(rawValue, normalizedScore, weightPoints, explanation) {

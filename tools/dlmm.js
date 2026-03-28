@@ -445,7 +445,11 @@ export async function getPositionPnl({ pool_address, position_address }) {
   try {
     const byAddress = await fetchDlmmPnlForPool(pool_address, walletAddress);
     const p = byAddress[position_address];
-    if (!p) return { error: "Position not found in PnL API" };
+    if (!p) return { error: "Position not found in PnL API", stale: true, status: "stale" };
+		const observedAtMs = Number.isFinite(Number(p.observed_at_ms ?? p.as_of_ms ?? p.updatedAtMs ?? p.updated_at_ms))
+			? Number(p.observed_at_ms ?? p.as_of_ms ?? p.updatedAtMs ?? p.updated_at_ms)
+			: null;
+    const staleWithoutFreshness = observedAtMs == null;
 
     const unclaimedUsd    = parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0);
     const currentValueUsd = parseFloat(p.unrealizedPnl?.balances || 0);
@@ -461,10 +465,14 @@ export async function getPositionPnl({ pool_address, position_address }) {
       upper_bin:   p.upperBinId      ?? null,
       active_bin:  p.poolActiveBinId ?? null,
       age_minutes: p.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
+			observed_at_ms: observedAtMs,
+			max_age_ms: 60_000,
+      stale: staleWithoutFreshness,
+      status: staleWithoutFreshness ? "stale" : "ok",
     };
   } catch (error) {
     log("pnl_error", error.message);
-    return { error: error.message };
+    return { error: error.message, stale: true, status: "stale" };
   }
 }
 
@@ -546,15 +554,16 @@ export async function getMyPositions({ force = false } = {}) {
     uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
     const positions = raw.map((r) => {
-      const p = pnlByPool[r.pool]?.[r.position] || null;
+    const p = pnlByPool[r.pool]?.[r.position] || null;
 
       const lowerBin  = p?.lowerBinId      ?? r.lower_bin;
       const upperBin  = p?.upperBinId      ?? r.upper_bin;
       const activeBin = p?.poolActiveBinId ?? null;
       const oorDirection = getOutOfRangeDirection(lowerBin, upperBin, activeBin);
-      const inRange = p ? !p.isOutOfRange : true;
-      if (inRange) markInRange(r.position);
-      else markOutOfRange(r.position, oorDirection);
+      const pnlMissing = !p;
+      const inRange = p ? !p.isOutOfRange : null;
+      if (inRange === true) markInRange(r.position);
+      else if (inRange === false) markOutOfRange(r.position, oorDirection);
 
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
@@ -590,6 +599,9 @@ export async function getMyPositions({ force = false } = {}) {
         upper_bin: upperBin,
         active_bin: activeBin,
         in_range: inRange,
+			pnl_missing: pnlMissing,
+			stale: p?.stale === true || p?.status === "stale",
+			status: p?.status || (pnlMissing ? "missing" : "ok"),
         out_of_range_direction: oorDirection,
         unclaimed_fees_usd: Math.round(unclaimedFees * 100) / 100,
         total_value_usd: Math.round(totalValue * 100) / 100,
@@ -962,6 +974,53 @@ export async function rebalanceOnExit({
     decision_context,
     bypass_portfolio_guard: true,
   };
+	const remainingPositions = await getMyPositions({ force: true });
+	if (remainingPositions?.error || !Array.isArray(remainingPositions?.positions)) {
+		return {
+			success: false,
+			error: `Rebalance redeploy blocked: unable to verify remaining positions (${remainingPositions?.error || "invalid positions payload"})`,
+			position: position_address,
+			close_result: closeResult,
+		};
+	}
+	const targetPoolMints = await resolvePoolTokenMints({
+		poolAddress: deployArgs.pool_address,
+		getPool,
+	});
+	if (targetPoolMints?.error) {
+		return {
+			success: false,
+			error: `Rebalance redeploy blocked: target pool mint lookup failed (${targetPoolMints.error})`,
+			position: position_address,
+			close_result: closeResult,
+		};
+	}
+	const rebalanceWallet = await getWalletBalances({});
+	const remainingOpenPositions = remainingPositions.positions.filter((position) => position.position !== position_address);
+	const redeployAdmission = evaluateDeployAdmission({
+		config,
+		poolAddress: deployArgs.pool_address,
+		baseMint: targetPoolMints.token_x_mint,
+		amountY: deployArgs.amount_y ?? 0,
+		amountX: deployArgs.amount_x ?? 0,
+		binStep: deployArgs.bin_step ?? context.position.bin_step ?? null,
+		positions: remainingOpenPositions,
+		positionsCount: remainingOpenPositions.length,
+		walletSol: rebalanceWallet?.sol ?? null,
+		portfolioGuard: evaluatePortfolioGuard({
+			portfolioSnapshot: rebalanceWallet,
+			openPositionPnls: buildOpenPositionPnlInputs(remainingOpenPositions),
+		}),
+		poolCooldown: getPoolDeployCooldown({ pool_address: deployArgs.pool_address }),
+	});
+	if (!redeployAdmission.pass) {
+		return {
+			success: false,
+			error: `Rebalance redeploy blocked: ${redeployAdmission.message}`,
+			position: position_address,
+			close_result: closeResult,
+		};
+	}
   const deployResult = await deployPosition(deployArgs);
 
   if (!deployResult?.success) {

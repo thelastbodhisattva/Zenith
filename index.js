@@ -118,7 +118,13 @@ const bootRecoveryOverrideActive = isBootRecoveryOverrideAllowed(
 const bootRecoveryBlockActive = bootRecovery.suppress_autonomous_writes && !bootRecoveryOverrideActive;
 
 if (bootRecoveryOverrideActive) {
-  setAutonomousWriteSuppression({ suppressed: false });
+  setAutonomousWriteSuppression({
+		suppressed: false,
+		reason: `manual review required for ${bootRecovery.parked_manual_review_workflows.length} workflow(s)`,
+		code: bootRecovery.reason_code,
+		incidentKey: bootRecovery.incident_key,
+		overrideUntil: recoveryResumeOverride.override_until,
+	});
   log(
     "recovery_override",
     `Autonomous writes resumed due to persisted operator override until ${recoveryResumeOverride.override_until} (${recoveryResumeOverride.reason || "no reason provided"})`

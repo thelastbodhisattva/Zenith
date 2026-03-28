@@ -161,12 +161,18 @@ let _autonomousWriteSuppressed = false;
 let _writeSuppressionReason = null;
 let _writeSuppressionCode = null;
 let _writeSuppressionIncidentKey = null;
+let _writeSuppressionOverrideUntilMs = null;
+let _writeSuppressionResumeReason = null;
+let _writeSuppressionResumeCode = null;
+let _writeSuppressionResumeIncidentKey = null;
 
 export function setAutonomousWriteSuppression({
 	suppressed,
 	reason = null,
 	code = null,
 	incidentKey = null,
+	overrideUntil = null,
+	overrideUntilMs = null,
 } = {}) {
 	_autonomousWriteSuppressed = Boolean(suppressed);
 	_writeSuppressionReason = _autonomousWriteSuppressed
@@ -174,14 +180,41 @@ export function setAutonomousWriteSuppression({
 		: null;
 	_writeSuppressionCode = _autonomousWriteSuppressed ? code || null : null;
 	_writeSuppressionIncidentKey = _autonomousWriteSuppressed ? incidentKey || null : null;
+	if (_autonomousWriteSuppressed) {
+		_writeSuppressionOverrideUntilMs = null;
+		_writeSuppressionResumeReason = null;
+		_writeSuppressionResumeCode = null;
+		_writeSuppressionResumeIncidentKey = null;
+		return;
+	}
+	const parsedOverrideUntilMs = Number.isFinite(Number(overrideUntilMs))
+		? Number(overrideUntilMs)
+		: Number.isFinite(Date.parse(overrideUntil || ""))
+			? Date.parse(overrideUntil)
+			: null;
+	_writeSuppressionOverrideUntilMs = parsedOverrideUntilMs;
+	_writeSuppressionResumeReason = reason || null;
+	_writeSuppressionResumeCode = code || null;
+	_writeSuppressionResumeIncidentKey = incidentKey || null;
 }
 
 export function getAutonomousWriteSuppression() {
+	if (!_autonomousWriteSuppressed && Number.isFinite(_writeSuppressionOverrideUntilMs) && Date.now() > _writeSuppressionOverrideUntilMs) {
+		_autonomousWriteSuppressed = true;
+		_writeSuppressionReason = _writeSuppressionResumeReason || "manual review required";
+		_writeSuppressionCode = _writeSuppressionResumeCode || null;
+		_writeSuppressionIncidentKey = _writeSuppressionResumeIncidentKey || null;
+		_writeSuppressionOverrideUntilMs = null;
+		_writeSuppressionResumeReason = null;
+		_writeSuppressionResumeCode = null;
+		_writeSuppressionResumeIncidentKey = null;
+	}
 	return {
 		suppressed: _autonomousWriteSuppressed,
 		reason: _writeSuppressionReason,
 		code: _writeSuppressionCode,
 		incident_key: _writeSuppressionIncidentKey,
+		override_until: Number.isFinite(_writeSuppressionOverrideUntilMs) ? new Date(_writeSuppressionOverrideUntilMs).toISOString() : null,
 	};
 }
 
@@ -521,6 +554,19 @@ export async function executeTool(name, args, meta = {}) {
 				reason: safetyCheck.reason,
 			};
 		}
+	}
+
+	if (meta.cycle_id && name === "remember_fact") {
+		return {
+			blocked: true,
+			reason: "Autonomous memory mutation is disabled for cycle-driven roles.",
+		};
+	}
+	if (meta.cycle_id && (name === "set_position_note" || name === "add_pool_note")) {
+		return {
+			blocked: true,
+			reason: "Autonomous note mutation is disabled for cycle-driven roles.",
+		};
 	}
 
 	if (WRITE_TOOLS.has(name)) {
