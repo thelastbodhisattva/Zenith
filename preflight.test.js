@@ -134,6 +134,35 @@ test("risk-opening preflight fails with stable runbook slugs for health, recover
 			config: baseConfig,
 		});
 		assert.equal(guard.reason_code, "OPEN_RISK_LIMIT");
+		clearPortfolioGuardPause({ reason: "preflight unknown-risk branch reset" });
+
+		const unknownOpenRisk = buildRiskOpeningPreflightReport({
+			tool_name: "deploy_position",
+			startupSnapshot: {
+				wallet: { sol: 2, sol_usd: 300 },
+				positions: { positions: [{ pnl_missing: true }] },
+			},
+			isFailClosedResult: () => false,
+			recoveryReport: { status: "clear" },
+			suppression: { suppressed: false },
+			approval: { pass: true, scope: {} },
+			config: baseConfig,
+		});
+		assert.equal(unknownOpenRisk.reason_code, "OPEN_RISK_STATE_UNKNOWN");
+
+		const staleOpenRisk = buildRiskOpeningPreflightReport({
+			tool_name: "deploy_position",
+			startupSnapshot: {
+				wallet: { sol: 2, sol_usd: 300 },
+				positions: { positions: [{ pnl_usd: -5, stale: true, status: "stale" }] },
+			},
+			isFailClosedResult: () => false,
+			recoveryReport: { status: "clear" },
+			suppression: { suppressed: false },
+			approval: { pass: true, scope: {} },
+			config: baseConfig,
+		});
+		assert.equal(staleOpenRisk.reason_code, "OPEN_RISK_STATE_UNKNOWN");
 	} finally {
 		Object.assign(config.protections, originalProtections);
 		clearPortfolioGuardPause({ reason: "preflight test cleanup" });

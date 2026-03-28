@@ -27,7 +27,7 @@ loadChatId();
 
 // ─── Core send ───────────────────────────────────────────────────
 export function isEnabled() {
-  return !!TOKEN;
+	return !!TOKEN && !!chatId;
 }
 
 export async function sendMessage(text) {

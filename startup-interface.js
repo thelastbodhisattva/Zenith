@@ -119,7 +119,7 @@ Commands:
   /replay <id>   Show one replay envelope
   /reconcile <id> Run replay reconciliation for one cycle
   /review        Show replay-backed review stats
-  /resume <why>  Clear current-process suppression after manual review
+  /resume <why>  Persist a bounded restart-aware override for the current unresolved-workflow incident
   /arm [min] [why]  Temporarily arm GENERAL free-form write tools
   /disarm        Remove GENERAL free-form write access
   /performance   Show recent closed-position performance history

@@ -24,6 +24,7 @@ test("telegram polling stays disabled without a configured chat id", async () =>
 		};
 
 		const telegram = await import(`./telegram.js?test=${Date.now()}`);
+		assert.equal(telegram.isEnabled(), false);
 		telegram.startPolling(() => {});
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.equal(fetchCalled, false);

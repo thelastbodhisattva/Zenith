@@ -44,6 +44,20 @@ function clearGeneralWriteScope(state) {
 	state.general_write_arm_scope = null;
 }
 
+function cloneState(state) {
+	return JSON.parse(JSON.stringify(state));
+}
+
+function persistStateAndAudit(state, actionEntry, previousState) {
+	saveState(state);
+	try {
+		appendOperatorAction(actionEntry);
+	} catch (error) {
+		saveState(previousState);
+		throw error;
+	}
+}
+
 function loadState() {
 	const snapshot = readJsonSnapshotWithBackupSync(STATE_FILE);
 	if (!snapshot.value) {
@@ -78,28 +92,28 @@ export function recordOperatorAction(entry = {}) {
 
 export function armGeneralWriteTools({ minutes = 10, reason = "manual operator arm", scope = null, nowMs = Date.now() } = {}) {
   const state = loadState();
+  const previousState = cloneState(state);
   state.general_write_arm_until_ms = nowMs + (Number(minutes) || 10) * 60_000;
   state.general_write_arm_reason = reason;
   state.general_write_arm_scope = normalizeGeneralWriteScope(scope);
-  saveState(state);
-  appendOperatorAction({
+	persistStateAndAudit(state, {
 		type: "arm_general_writes",
 		minutes,
 		reason,
 		scope: state.general_write_arm_scope,
 		armed_until: new Date(state.general_write_arm_until_ms).toISOString(),
-	});
+	}, previousState);
   return getGeneralWriteArmStatus({ nowMs });
 }
 
 export function disarmGeneralWriteTools({ reason = "manual operator disarm", nowMs = Date.now() } = {}) {
   const state = loadState();
+  const previousState = cloneState(state);
   const wasArmed = state.general_write_arm_until_ms > nowMs;
   state.general_write_arm_until_ms = 0;
   state.general_write_arm_reason = null;
   clearGeneralWriteScope(state);
-  saveState(state);
-  appendOperatorAction({ type: "disarm_general_writes", reason, was_armed: wasArmed });
+	persistStateAndAudit(state, { type: "disarm_general_writes", reason, was_armed: wasArmed }, previousState);
   return getGeneralWriteArmStatus({ nowMs });
 }
 
@@ -179,8 +193,9 @@ export function consumeOneShotGeneralWriteApproval({
 	amount_sol = null,
 	nowMs = Date.now(),
 } = {}) {
-	const state = loadState();
-	const scope = normalizeGeneralWriteScope(state.general_write_arm_scope);
+  const state = loadState();
+  const previousState = cloneState(state);
+  const scope = normalizeGeneralWriteScope(state.general_write_arm_scope);
 	const remainingMs = Math.max(0, Number(state.general_write_arm_until_ms || 0) - nowMs);
 	if (remainingMs <= 0 || !scope?.one_shot) {
 		return getGeneralWriteArmStatus({ nowMs });
@@ -195,18 +210,17 @@ export function consumeOneShotGeneralWriteApproval({
 	if (!approval.pass) {
 		return getGeneralWriteArmStatus({ nowMs });
 	}
-	state.general_write_arm_until_ms = 0;
-	state.general_write_arm_reason = null;
-	clearGeneralWriteScope(state);
-	saveState(state);
-	appendOperatorAction({
+  state.general_write_arm_until_ms = 0;
+  state.general_write_arm_reason = null;
+  clearGeneralWriteScope(state);
+	persistStateAndAudit(state, {
 		type: "consume_general_write_approval",
 		tool_name,
 		pool_address,
 		position_address,
 		amount_sol,
-	});
-	return getGeneralWriteArmStatus({ nowMs });
+	}, previousState);
+  return getGeneralWriteArmStatus({ nowMs });
 }
 
 export function getRecoveryResumeOverrideStatus({ nowMs = Date.now() } = {}) {
@@ -238,13 +252,13 @@ export function getOperatorControlSnapshot({ nowMs = Date.now(), recentActionLim
 
 export function clearRecoveryResumeOverride({ reason = "operator clear", nowMs = Date.now() } = {}) {
   const state = loadState();
+  const previousState = cloneState(state);
   const wasActive = Number(state.recovery_resume_override_until_ms || 0) > nowMs;
   state.recovery_resume_override_until_ms = 0;
   state.recovery_resume_override_reason = null;
   state.recovery_resume_override_source = null;
   state.recovery_resume_override_incident_key = null;
-  saveState(state);
-  appendOperatorAction({ type: "clear_recovery_resume_override", reason, was_active: wasActive });
+	persistStateAndAudit(state, { type: "clear_recovery_resume_override", reason, was_active: wasActive }, previousState);
   return getRecoveryResumeOverrideStatus({ nowMs });
 }
 
@@ -258,13 +272,12 @@ export function acknowledgeRecoveryResume({
   nowMs = Date.now(),
 } = {}) {
   const state = loadState();
+  const previousState = cloneState(state);
   state.recovery_resume_override_until_ms = nowMs + Math.max(1, Number(override_minutes) || 180) * 60_000;
   state.recovery_resume_override_reason = reason || "manual resume";
   state.recovery_resume_override_source = source;
   state.recovery_resume_override_incident_key = incident_key;
-  saveState(state);
-
-  appendOperatorAction({
+	persistStateAndAudit(state, {
     type: "resume_autonomous_writes",
     reason: state.recovery_resume_override_reason,
     source,
@@ -273,7 +286,7 @@ export function acknowledgeRecoveryResume({
     incident_key,
     override_minutes,
     override_until: new Date(state.recovery_resume_override_until_ms).toISOString(),
-  });
+	}, previousState);
 
   return getRecoveryResumeOverrideStatus({ nowMs });
 }

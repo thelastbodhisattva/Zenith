@@ -111,22 +111,37 @@ export async function handleOperatorCommandText({
     const suppression = getAutonomousWriteSuppression();
     const resumableWorkflowBlock = suppression.suppressed
       && suppression.code === "UNRESOLVED_WORKFLOW"
-      && Boolean(suppression.incident_key);
+      && Boolean(suppression.incident_key)
+      && report.incident_key === suppression.incident_key;
     if (!resumableWorkflowBlock) {
       return {
         handled: true,
         message: "Cannot persist resume override unless autonomous writes are currently suppressed for an unresolved-workflow manual-review block.",
       };
     }
-    setAutonomousWriteSuppression({ suppressed: false });
-    const override = acknowledgeRecoveryResume({
-      reason,
-      report_status: report.status,
-      cleared_guard_pause: false,
-      incident_key: suppression.incident_key,
-      source,
-      override_minutes: config.protections.recoveryResumeOverrideMinutes,
-    });
+    let override;
+		try {
+			override = acknowledgeRecoveryResume({
+				reason,
+				report_status: report.status,
+				cleared_guard_pause: false,
+				incident_key: suppression.incident_key,
+				source,
+				override_minutes: config.protections.recoveryResumeOverrideMinutes,
+			});
+		} catch (error) {
+			return {
+				handled: true,
+				message: `Cannot persist resume override: ${error.message}`,
+			};
+		}
+    setAutonomousWriteSuppression({
+			suppressed: false,
+			reason: suppression.reason,
+			code: suppression.code,
+			incidentKey: suppression.incident_key,
+			overrideUntil: override.override_until,
+		});
     const snapshot = getOperatorControlSnapshot?.() || { recovery_resume_override: override };
     refreshRuntimeHealth();
     return {

@@ -20,6 +20,12 @@ test("general role is read-only unless dangerous tools are explicitly allowed", 
 	const managerTools = getToolsForRole("MANAGER").map((tool) => tool.function.name);
 	assert.equal(screenerTools.includes("update_config"), false);
 	assert.equal(managerTools.includes("update_config"), false);
+	assert.equal(screenerTools.includes("remember_fact"), false);
+	assert.equal(managerTools.includes("remember_fact"), false);
+	assert.equal(screenerTools.includes("add_pool_note"), false);
+	assert.equal(managerTools.includes("set_position_note"), false);
+	assert.equal(screenerTools.includes("recall_memory"), false);
+	assert.equal(managerTools.includes("recall_memory"), false);
 
 	const generalScoped = getToolsForRole("GENERAL", {
 		allowDangerousTools: true,

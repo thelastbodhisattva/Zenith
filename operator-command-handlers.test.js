@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { handleOperatorCommandText } from "./operator-command-handlers.js";
+import {
+	getAutonomousWriteSuppression as getExecutorSuppression,
+	setAutonomousWriteSuppression as setExecutorSuppression,
+} from "./tools/executor.js";
 
 test("operator command handler blocks resume on journal invalid", async () => {
   const result = await handleOperatorCommandText({
@@ -108,7 +112,7 @@ test("operator resume clears suppression without clearing portfolio guard pause"
 		text: "/resume manual review complete",
 		source: "test",
 		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
-		getRecoveryWorkflowReport: () => ({ status: "manual_review_required" }),
+		getRecoveryWorkflowReport: () => ({ status: "manual_review_required", incident_key: "wf-1|wf-2" }),
 		getAutonomousWriteSuppression: () => ({ suppressed: true, reason: "manual review required", code: "UNRESOLVED_WORKFLOW", incident_key: "wf-1|wf-2" }),
 		clearPortfolioGuardPause: () => {
 			guardCleared = true;
@@ -131,6 +135,88 @@ test("operator resume clears suppression without clearing portfolio guard pause"
 	assert.equal(suppressionCleared, true);
 	assert.equal(guardCleared, false);
 	assert.match(result.message, /portfolio guard pause unchanged/i);
+});
+
+test("operator resume keeps suppression active when durable override persistence fails", async () => {
+	let suppressionCleared = false;
+	const result = await handleOperatorCommandText({
+		text: "/resume manual review complete",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "manual_review_required", incident_key: "wf-1|wf-2" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: true, reason: "manual review required", code: "UNRESOLVED_WORKFLOW", incident_key: "wf-1|wf-2" }),
+		setAutonomousWriteSuppression: ({ suppressed }) => {
+			suppressionCleared = suppressed === false;
+		},
+		acknowledgeRecoveryResume: () => {
+			throw new Error("disk full");
+		},
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.equal(suppressionCleared, false);
+	assert.match(result.message, /cannot persist resume override: disk full/i);
+});
+
+test("operator resume only unsuppresses until override expiry in-process", async () => {
+	const originalDateNow = Date.now;
+	try {
+		let now = Date.parse("2030-01-01T00:00:00.000Z");
+		Date.now = () => now;
+		setExecutorSuppression({ suppressed: true, reason: "manual review required", code: "UNRESOLVED_WORKFLOW", incidentKey: "wf-1" });
+		await handleOperatorCommandText({
+			text: "/resume ok",
+			source: "test",
+			config: { protections: { recoveryResumeOverrideMinutes: 1 } },
+			getRecoveryWorkflowReport: () => ({ status: "manual_review_required", incident_key: "wf-1" }),
+			getAutonomousWriteSuppression: getExecutorSuppression,
+			setAutonomousWriteSuppression: setExecutorSuppression,
+			acknowledgeRecoveryResume: () => ({ override_until: new Date(now + 60_000).toISOString(), incident_key: "wf-1" }),
+			armGeneralWriteTools: () => ({ armed_until: null }),
+			disarmGeneralWriteTools: () => ({ armed: false }),
+			getOperatorControlSnapshot: () => ({ general_write_arm: { armed: false }, recovery_resume_override: { active: true, override_until: new Date(now + 60_000).toISOString() } }),
+			refreshRuntimeHealth: () => {},
+		});
+		now += 120_000;
+		assert.equal(getExecutorSuppression().suppressed, true);
+	} finally {
+		setExecutorSuppression({ suppressed: false });
+		Date.now = originalDateNow;
+	}
+});
+
+test("operator resume rejects incident-key mismatch between report and suppression", async () => {
+	let acknowledgeCalled = false;
+	const result = await handleOperatorCommandText({
+		text: "/resume manual review complete",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "manual_review_required", incident_key: "wf-other" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: true, reason: "manual review required", code: "UNRESOLVED_WORKFLOW", incident_key: "wf-1|wf-2" }),
+		setAutonomousWriteSuppression: () => {},
+		acknowledgeRecoveryResume: () => {
+			acknowledgeCalled = true;
+			return { override_until: null };
+		},
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.equal(acknowledgeCalled, false);
+	assert.match(result.message, /cannot persist resume override unless autonomous writes are currently suppressed/i);
 });
 
 test("operator resume blocks override when suppression is not an unresolved-workflow boot block", async () => {
