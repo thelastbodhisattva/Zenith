@@ -29,6 +29,16 @@ function emptyLessonsData() {
 	return { lessons: [], performance: [] };
 }
 
+function isObject(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isLessonsShape(value) {
+	return isObject(value)
+		&& Array.isArray(value.lessons)
+		&& Array.isArray(value.performance);
+}
+
 function load() {
 	const snapshot = readJsonSnapshotWithBackupSync(LESSONS_FILE);
 	if (!snapshot.value) {
@@ -38,6 +48,15 @@ function load() {
 			...emptyLessonsData(),
 			_invalid_state: true,
 			_error: snapshot.error,
+		};
+	}
+	if (!isLessonsShape(snapshot.value)) {
+		const error = "lessons.json has invalid shape";
+		log("lessons_warn", error);
+		return {
+			...emptyLessonsData(),
+			_invalid_state: true,
+			_error: error,
 		};
 	}
 	return {
@@ -184,7 +203,7 @@ export async function recordPerformance(perf) {
 		const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
 		if (perf.strategy && perf.bin_step != null) {
 			rememberStrategy(
-				{ strategy: perf.strategy, bin_step: perf.bin_step },
+				{ strategy: perf.strategy, bin_step: perf.bin_step, role: "MANAGER" },
 				`${outcome}, PnL ${pnl_pct.toFixed(1)}%, vol=${perf.volatility}, fee_tvl=${perf.fee_tvl_ratio}`,
 			);
 		}
@@ -203,6 +222,7 @@ export async function recordPerformance(perf) {
 			fee_yield_pct: entry.fee_yield_pct,
 			minutes_held: perf.minutes_held ?? null,
 			success: entry.pnl_pct >= 0,
+			role: "MANAGER",
 		});
 	} catch (error) {
 		log(
@@ -489,7 +509,7 @@ export function getLessonsForPrompt(opts = {}) {
 	const { agentType = "GENERAL", maxLessons } = opts;
 
 	const data = load();
-	if (data._invalid_state) return null;
+	if (data._invalid_state) return `[INVALID LESSONS STATE] ${data._error}`;
 	if (data.lessons.length === 0) return null;
 
 	// Smaller caps for automated cycles — they don't need the full lesson history
@@ -550,7 +570,15 @@ export function getLessonsForPrompt(opts = {}) {
 	const recent =
 		remainingBudget > 0
 			? data.lessons
-					.filter((l) => !usedIds.has(l.id))
+					.filter((l) => {
+						if (usedIds.has(l.id)) return false;
+						const roleOk = !l.role || l.role === agentType || agentType === "GENERAL";
+						const tagOk =
+							roleTags.length === 0 ||
+							!l.tags?.length ||
+							l.tags.some((t) => roleTags.includes(t));
+						return roleOk && tagOk;
+					})
 					.sort((a, b) =>
 						(b.created_at || "").localeCompare(a.created_at || ""),
 					)

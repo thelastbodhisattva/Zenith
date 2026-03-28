@@ -4,8 +4,8 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 import { createActionId } from "./cycle-trace.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "rebalance_on_exit", "auto_compound_fees", "swap_token", "get_position_pnl", "get_my_positions", "set_position_note", "add_pool_note", "get_wallet_balance", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "get_wallet_balance", "get_my_positions", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
+const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "rebalance_on_exit", "auto_compound_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers"]);
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_to_blacklist", "get_wallet_balance", "get_my_positions", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers"]);
 const GENERAL_SAFE_TOOLS = new Set([
   "discover_pools",
   "get_top_candidates",
@@ -90,7 +90,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
-  const memoryContext = getMemoryContext();
+  const memoryContext = getMemoryContext(agentType);
   const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, memoryContext);
 
   const messages = [

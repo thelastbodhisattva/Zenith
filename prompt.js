@@ -49,6 +49,9 @@ function summarizeState(stateSummary = {}) {
 
 function summarizePerformance(perfSummary) {
   if (!perfSummary) return "No closed positions yet";
+  if (perfSummary.invalid_state) {
+		return `INVALID PERFORMANCE STATE: ${perfSummary.error || "unknown error"}`;
+	}
   return formatCompactJson({
     total_positions_closed: perfSummary.total_positions_closed,
     total_pnl_usd: perfSummary.total_pnl_usd,

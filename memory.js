@@ -6,6 +6,19 @@ import { log } from "./logger.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAVE_DIR = process.env.ZENITH_MEMORY_DIR || path.join(__dirname, "data", "nuggets");
 const DEFAULT_NUGGETS = ["strategies", "lessons", "patterns", "facts", "wallet_scores", "distribution_stats"];
+const PROMPT_MEMORY_NUGGETS = new Set(["strategies", "distribution_stats"]);
+const MEMORY_ROLE_TAGS = new Set(["manager", "screener", "general"]);
+
+function matchesRole(fact, role = null) {
+	if (!role) return true;
+	const normalizedRole = String(role).toLowerCase();
+	const factRoles = Array.isArray(fact?.tags)
+		? fact.tags
+			.filter((tag) => MEMORY_ROLE_TAGS.has(String(tag).toLowerCase()))
+			.map((tag) => String(tag).toLowerCase())
+		: [];
+	return factRoles.length === 0 || factRoles.includes(normalizedRole);
+}
 
 let shelf = null;
 
@@ -81,13 +94,14 @@ function upsertFact(nuggetName, key, value, options = {}) {
   if (existing) {
     existing.value = factValue;
     existing.updated_at = now;
+    existing.hits = Math.max(Number(existing.hits) || 0, 1);
     if (options.tags !== undefined) existing.tags = tags;
     if (options.data !== undefined) existing.data = data;
   } else {
     nugget.facts.push({
       key: safeKey,
       value: factValue,
-      hits: 0,
+      hits: 1,
       created_at: now,
       updated_at: now,
       tags,
@@ -145,7 +159,7 @@ function scoreFact(fact, query) {
   return overlap / queryTokens.length;
 }
 
-function recallBest(query, nuggetName = null) {
+function recallBest(query, nuggetName = null, role = null) {
   const store = getShelf();
   const nuggets = nuggetName
     ? [store.getOrCreate(nuggetName)]
@@ -155,6 +169,7 @@ function recallBest(query, nuggetName = null) {
 
   for (const nugget of nuggets) {
     for (const fact of nugget.facts) {
+			if (!matchesRole(fact, role)) continue;
       const confidence = scoreFact(fact, query);
       if (confidence < 0.34) continue;
       if (!best || confidence > best.confidence) {
@@ -166,10 +181,6 @@ function recallBest(query, nuggetName = null) {
   if (!best) {
     return { found: false, query, nugget: nuggetName || null };
   }
-
-  best.fact.hits = (best.fact.hits || 0) + 1;
-  best.fact.updated_at = new Date().toISOString();
-  saveNugget(best.nugget);
 
   return {
     found: true,
@@ -217,10 +228,12 @@ export function getShelf() {
 }
 
 export function rememberStrategy(pattern, result) {
+	const role = typeof pattern === "object" && pattern !== null ? String(pattern.role || "").toLowerCase() : "";
+	const tags = MEMORY_ROLE_TAGS.has(role) ? [role] : undefined;
   const key = typeof pattern === "object" && pattern !== null
     ? buildStrategyMemoryKey(pattern.strategy, pattern.bin_step)
     : sanitizeKey(pattern);
-  upsertFact("strategies", key, typeof result === "string" ? result : JSON.stringify(result));
+  upsertFact("strategies", key, typeof result === "string" ? result : JSON.stringify(result), { tags });
   log("memory", `Remembered strategy: ${key}`);
 }
 
@@ -235,7 +248,7 @@ export function recallForScreening(poolData) {
       ];
 
       for (const key of keysToTry) {
-        const hit = recallBest(key, "strategies");
+				const hit = recallBest(key, "strategies", "SCREENER");
         if (hit.found && !results.some((result) => result.key === hit.key)) {
           results.push({ source: "strategies", ...hit });
           break;
@@ -256,7 +269,7 @@ export function recallForManagement(position) {
       buildLegacyStrategyMemoryKey(position.strategy, position.bin_step),
     ];
     for (const key of keysToTry) {
-      const hit = recallBest(key, "strategies");
+			const hit = recallBest(key, "strategies", "MANAGER");
       if (hit.found) {
         results.push({ source: "strategies", ...hit });
         break;
@@ -264,20 +277,23 @@ export function recallForManagement(position) {
     }
   }
 
-  const lessonHit = recallBest("management", "lessons");
+	const lessonHit = recallBest("management", "lessons", "MANAGER");
   if (lessonHit.found) results.push({ source: "lessons", ...lessonHit });
 
   return results;
 }
 
-export function getMemoryContext() {
+export function getMemoryContext(agentType = "GENERAL") {
   const store = getShelf();
   const facts = [];
+	const normalizedRole = String(agentType || "GENERAL").toLowerCase();
 
-  for (const { name } of store.list()) {
-    const nugget = store.get(name);
+	for (const { name } of store.list()) {
+		if (!PROMPT_MEMORY_NUGGETS.has(name)) continue;
+		const nugget = store.get(name);
     for (const fact of nugget.facts) {
       if ((fact.hits || 0) < 1) continue;
+			if (!matchesRole(fact, normalizedRole)) continue;
       facts.push({
         nugget: name,
         key: fact.key,
@@ -330,7 +346,7 @@ export function rememberFact(nuggetOrPayload, keyArg, valueArg) {
 }
 
 export function recallMemory(query, nuggetName) {
-  const result = recallBest(query, nuggetName || null);
+	const result = recallBest(query, nuggetName || null, "GENERAL");
   log("memory", `Recall "${query}" -> ${result.found ? result.answer : "not found"}`);
   return result;
 }
@@ -409,6 +425,7 @@ export function rememberTokenTypeDistribution({
   fee_yield_pct = null,
   minutes_held = null,
   success = null,
+  role = null,
 }) {
   if (!distribution_key) return { saved: false, error: "distribution_key required" };
 
@@ -489,7 +506,11 @@ export function rememberTokenTypeDistribution({
 
   if (fact) {
     fact.value = summary;
-    fact.tags = ["distribution_success", strategyKey];
+		fact.tags = [
+			"distribution_success",
+			strategyKey,
+			...(MEMORY_ROLE_TAGS.has(String(role || "").toLowerCase()) ? [String(role).toLowerCase()] : []),
+		];
     fact.data = next;
     fact.updated_at = next.last_recorded_at;
   } else {
@@ -499,9 +520,13 @@ export function rememberTokenTypeDistribution({
       hits: 0,
       created_at: next.last_recorded_at,
       updated_at: next.last_recorded_at,
-      tags: ["distribution_success", strategyKey],
-      data: next,
-    });
+			tags: [
+				"distribution_success",
+				strategyKey,
+				...(MEMORY_ROLE_TAGS.has(String(role || "").toLowerCase()) ? [String(role).toLowerCase()] : []),
+			],
+        data: next,
+      });
   }
 
   saveNugget(nugget);

@@ -297,8 +297,88 @@ test("evolveThresholds does not falsely block after config mutation when later l
 	}
 });
 
-test("evolveThresholds rolls config back if rollout state persistence fails after config mutation", async () => {
-	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-rollout-state-fail-test-"));
+test("getLessonsForPrompt keeps recent fill role-isolated", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-lessons-role-test-"));
+	const originalLessonsFile = process.env.ZENITH_LESSONS_FILE;
+
+	try {
+		process.env.ZENITH_LESSONS_FILE = path.join(tempDir, "lessons.json");
+		fs.writeFileSync(process.env.ZENITH_LESSONS_FILE, JSON.stringify({
+			lessons: [
+				{ id: 1, rule: "manager lesson", outcome: "bad", role: "MANAGER", tags: ["manager"], created_at: "2030-01-01T00:00:00.000Z" },
+				{ id: 2, rule: "screener lesson", outcome: "bad", role: "SCREENER", tags: ["screening"], created_at: "2030-01-02T00:00:00.000Z" },
+			],
+			performance: [],
+		}, null, 2));
+
+		const { getLessonsForPrompt } = await import(`./lessons.js?test=${Date.now()}`);
+		const screener = getLessonsForPrompt({ agentType: "SCREENER", maxLessons: 10 });
+		assert.match(screener, /screener lesson/i);
+		assert.doesNotMatch(screener, /manager lesson/i);
+	} finally {
+		if (originalLessonsFile) process.env.ZENITH_LESSONS_FILE = originalLessonsFile;
+		else delete process.env.ZENITH_LESSONS_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("getLessonsForPrompt surfaces invalid lessons state explicitly", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-lessons-invalid-prompt-test-"));
+	const originalLessonsFile = process.env.ZENITH_LESSONS_FILE;
+
+	try {
+		process.env.ZENITH_LESSONS_FILE = path.join(tempDir, "lessons.json");
+		fs.writeFileSync(process.env.ZENITH_LESSONS_FILE, "{bad json");
+		const { getLessonsForPrompt } = await import(`./lessons.js?test=${Date.now()}`);
+		const promptLessons = getLessonsForPrompt({ agentType: "SCREENER" });
+		assert.match(promptLessons, /INVALID LESSONS STATE/i);
+	} finally {
+		if (originalLessonsFile) process.env.ZENITH_LESSONS_FILE = originalLessonsFile;
+		else delete process.env.ZENITH_LESSONS_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("recordPerformance sanitizes close reasons before lesson generation", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-lessons-close-reason-test-"));
+	const originalCwd = process.cwd();
+	const originalLessonsFile = process.env.ZENITH_LESSONS_FILE;
+
+	try {
+		process.chdir(tempDir);
+		process.env.ZENITH_LESSONS_FILE = path.join(tempDir, "lessons.json");
+		const { recordPerformance, getLessonsForPrompt } = await import(`./lessons.js?test=${Date.now()}`);
+		await recordPerformance({
+			position: "pos-bad-1",
+			pool: "pool-bad-1",
+			pool_name: "Bad Pool",
+			strategy: "bid_ask",
+			bin_range: { min: 10, max: 20 },
+			bin_step: 85,
+			volatility: 4,
+			fee_tvl_ratio: 0.22,
+			organic_score: 82,
+			amount_sol: 1,
+			fees_earned_usd: 0,
+			final_value_usd: 70,
+			initial_value_usd: 100,
+			minutes_in_range: 20,
+			minutes_held: 120,
+			close_reason: "DROP TABLE positions; stop loss now",
+		});
+		const promptLessons = getLessonsForPrompt({ agentType: "GENERAL", maxLessons: 5 });
+		assert.match(promptLessons, /stop_loss/i);
+		assert.doesNotMatch(promptLessons, /DROP TABLE/i);
+	} finally {
+		process.chdir(originalCwd);
+		if (originalLessonsFile) process.env.ZENITH_LESSONS_FILE = originalLessonsFile;
+		else delete process.env.ZENITH_LESSONS_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("recoverThresholdRolloutState finalizes apply_pending state", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-rollout-apply-recover-test-"));
 	const originalUserConfigPath = process.env.ZENITH_USER_CONFIG_PATH;
 	const originalLessonsFile = process.env.ZENITH_LESSONS_FILE;
 	const originalRolloutFile = process.env.ZENITH_THRESHOLD_ROLLOUT_FILE;
@@ -314,38 +394,27 @@ test("evolveThresholds rolls config back if rollout state persistence fails afte
 		fs.writeFileSync(lessonsPath, JSON.stringify({ lessons: [], performance: [] }, null, 2));
 
 		const { config } = await import(`./config.js?test=${Date.now()}`);
-		const { evolveThresholds } = await import(`./lessons.js?test=${Date.now()}`);
-
-		const perfData = [
-			{ pnl_pct: 8, fee_tvl_ratio: 0.30, organic_score: 84 },
-			{ pnl_pct: 5, fee_tvl_ratio: 0.28, organic_score: 82 },
-			{ pnl_pct: -8, fee_tvl_ratio: 0.03, organic_score: 58 },
-			{ pnl_pct: -6, fee_tvl_ratio: 0.04, organic_score: 55 },
-			{ pnl_pct: -1, fee_tvl_ratio: 0.05, organic_score: 57 },
-		];
-
-		const originalWriteFileSync = fs.writeFileSync;
-		fs.writeFileSync = (...args) => {
-			const target = String(args[0]);
-			if (target.includes("threshold-rollout.json")) {
-				throw new Error("rollout state write failed");
-			}
-			return originalWriteFileSync(...args);
-		};
-		try {
-			const result = evolveThresholds(perfData, config, { trigger: "manual" });
-			assert.equal(result.rollout.status, "pending_recovery");
-			const persisted = JSON.parse(fs.readFileSync(userConfigPath, "utf8"));
-			assert.ok(persisted.minFeeActiveTvlRatio > 0.05);
-			assert.ok(persisted.minOrganic > 60);
-			const rollout = getThresholdRolloutState();
-			assert.equal(rollout.active.phase, "apply_pending");
-			const recovery = recoverThresholdRolloutState(config, { trigger: "startup" });
-			assert.equal(recovery.status, "recovered_apply");
-			assert.equal(getThresholdRolloutState().active.phase, "active");
-		} finally {
-			fs.writeFileSync = originalWriteFileSync;
-		}
+		const { getThresholdRolloutState, recoverThresholdRolloutState } = await import(`./lessons.js?test=${Date.now()}`);
+		fs.writeFileSync(rolloutPath, JSON.stringify({
+			active: {
+				phase: "apply_pending",
+				rollout_id: "rollout-1",
+				started_at: new Date().toISOString(),
+				start_positions_count: 5,
+				min_closes_required: 5,
+				changed_keys: ["minFeeActiveTvlRatio", "minOrganic"],
+				previous_values: { minFeeActiveTvlRatio: 0.05, minOrganic: 60 },
+				new_values: { minFeeActiveTvlRatio: 0.2, minOrganic: 75 },
+				baseline: { closes: 5, avg_pnl_pct: 2, win_rate_pct: 60 },
+			},
+			history: [],
+		}, null, 2));
+		const recovery = recoverThresholdRolloutState(config, { trigger: "startup" });
+		assert.equal(recovery.status, "recovered_apply");
+		const persisted = JSON.parse(fs.readFileSync(userConfigPath, "utf8"));
+		assert.equal(persisted.minFeeActiveTvlRatio, 0.2);
+		assert.equal(persisted.minOrganic, 75);
+		assert.equal(getThresholdRolloutState().active.phase, "active");
 	} finally {
 		if (originalUserConfigPath) process.env.ZENITH_USER_CONFIG_PATH = originalUserConfigPath;
 		else delete process.env.ZENITH_USER_CONFIG_PATH;

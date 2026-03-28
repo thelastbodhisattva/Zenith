@@ -31,8 +31,13 @@ export function buildOpenPositionPnlInputs(positions = []) {
 		.map((position) => ({
 			pnl_usd: position?.pnl_usd,
 			pnl_pct: position?.pnl_pct,
+			unknown:
+				position?.pnl_missing === true ||
+				position?.pnl_unavailable === true ||
+				position?.stale === true ||
+				position?.status === "stale",
 		}))
-		.filter((position) => Number.isFinite(Number(position.pnl_usd)) || Number.isFinite(Number(position.pnl_pct)));
+		.filter((position) => position.unknown || Number.isFinite(Number(position.pnl_usd)) || Number.isFinite(Number(position.pnl_pct)));
 }
 
 export function normalizeOptionalNonNegativeNumber(value, fallback = null) {
