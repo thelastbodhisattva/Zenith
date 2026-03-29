@@ -494,7 +494,7 @@ export async function runInteractiveInterface({
 
     if (input === "/status") {
       await runBusy(async () => {
-        const snapshot = await getStartupSnapshot({ getWalletBalances, getMyPositions, getTopCandidates });
+        const snapshot = await getStartupSnapshot({ force: true, getWalletBalances, getMyPositions, getTopCandidates });
         if (isFailClosedResult(snapshot)) {
           console.log(`\nStatus unavailable: [${snapshot.reason_code}] ${snapshot.message}\n`);
           return;

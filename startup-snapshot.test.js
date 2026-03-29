@@ -23,7 +23,33 @@ test("startup snapshot caches successful fetches", async () => {
 
   assert.equal(calls, 1);
   assert.equal(first.wallet.sol, 1);
-  assert.equal(second.wallet.sol, 1);
+	assert.equal(second.wallet.sol, 1);
+});
+
+test("startup snapshot deduplicates concurrent reads while a fetch is inflight", async () => {
+	let walletCalls = 0;
+	let releaseFetch;
+	const gate = new Promise((resolve) => {
+		releaseFetch = resolve;
+	});
+	const deps = {
+		getWalletBalances: async () => {
+			walletCalls += 1;
+			await gate;
+			return { sol: 1 };
+		},
+		getMyPositions: async () => ({ positions: [], total_positions: 0 }),
+		getTopCandidates: async () => ({ candidates: [], total_eligible: 0, total_screened: 0 }),
+	};
+
+	const first = getStartupSnapshot(deps);
+	const second = getStartupSnapshot(deps);
+	releaseFetch();
+	const [firstResult, secondResult] = await Promise.all([first, second]);
+
+	assert.equal(walletCalls, 1);
+	assert.equal(firstResult.wallet.sol, 1);
+	assert.equal(secondResult.wallet.sol, 1);
 });
 
 test("startup snapshot fails closed on invalid payloads", async () => {
