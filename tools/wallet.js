@@ -8,6 +8,7 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { fetchWithTimeout } from "./fetch-utils.js";
 
 let _connection = null;
 let _wallet = null;
@@ -28,6 +29,7 @@ function getWallet() {
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
+const WALLET_FETCH_TIMEOUT_MS = 15 * 1000;
 
 function getJupiterHeaders(extra = {}) {
   const headers = { ...extra };
@@ -57,7 +59,10 @@ export async function getWalletBalances() {
 
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, {
+      timeoutMs: WALLET_FETCH_TIMEOUT_MS,
+      timeoutMessage: `Wallet balance request timed out after ${WALLET_FETCH_TIMEOUT_MS}ms`,
+    });
     
     if (!res.ok) {
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
@@ -164,7 +169,9 @@ export async function swapToken({
       `&amount=${amountStr}` +
       `&taker=${wallet.publicKey.toString()}`;
 
-    const orderRes = await fetch(orderUrl, {
+    const orderRes = await fetchWithTimeout(orderUrl, {
+      timeoutMs: WALLET_FETCH_TIMEOUT_MS,
+      timeoutMessage: `Swap order request timed out after ${WALLET_FETCH_TIMEOUT_MS}ms`,
       headers: getJupiterHeaders(),
     });
     if (!orderRes.ok) {
@@ -190,7 +197,9 @@ export async function swapToken({
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
 
     // ─── Execute ───────────────────────────────────────────────
-    const execRes = await fetch(`${JUPITER_ULTRA_API}/execute`, {
+    const execRes = await fetchWithTimeout(`${JUPITER_ULTRA_API}/execute`, {
+      timeoutMs: WALLET_FETCH_TIMEOUT_MS,
+      timeoutMessage: `Swap execute request timed out after ${WALLET_FETCH_TIMEOUT_MS}ms`,
       method: "POST",
       headers: getJupiterHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
@@ -222,16 +231,22 @@ export async function swapToken({
 
 async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr }) {
   // ─── Get quote ─────────────────────────────────────────────
-  const quoteRes = await fetch(
+  const quoteRes = await fetchWithTimeout(
     `${JUPITER_QUOTE_API}/quote?inputMint=${input_mint}&outputMint=${output_mint}&amount=${amountStr}&slippageBps=300`,
-    { headers: getJupiterHeaders() }
+    {
+      timeoutMs: WALLET_FETCH_TIMEOUT_MS,
+      timeoutMessage: `Swap quote request timed out after ${WALLET_FETCH_TIMEOUT_MS}ms`,
+      headers: getJupiterHeaders(),
+    }
   );
   if (!quoteRes.ok) throw new Error(`Quote failed: ${quoteRes.status} ${await quoteRes.text()}`);
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Quote error: ${quote.error}`);
 
   // ─── Get swap tx ───────────────────────────────────────────
-  const swapRes = await fetch(`${JUPITER_QUOTE_API}/swap`, {
+  const swapRes = await fetchWithTimeout(`${JUPITER_QUOTE_API}/swap`, {
+    timeoutMs: WALLET_FETCH_TIMEOUT_MS,
+    timeoutMessage: `Swap transaction request timed out after ${WALLET_FETCH_TIMEOUT_MS}ms`,
     method: "POST",
     headers: getJupiterHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({

@@ -26,6 +26,7 @@ import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import { getPoolDeployCooldown } from "../pool-memory.js";
 import { appendActionLifecycle } from "../action-journal.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
+import { fetchWithTimeout } from "./fetch-utils.js";
 import {
 	calculateDynamicBinTierPlan,
 	chooseDistributionStrategyPlan,
@@ -405,6 +406,7 @@ export async function deployPosition({
 }
 
 const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
+const DLMM_FETCH_TIMEOUT_MS = 15 * 1000;
 
 let _positionsCache = null;
 let _positionsCacheAt = 0;
@@ -414,7 +416,10 @@ let _positionsInflight = null; // deduplicates concurrent calls
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
   try {
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, {
+      timeoutMs: DLMM_FETCH_TIMEOUT_MS,
+      timeoutMessage: `DLMM PnL request timed out after ${DLMM_FETCH_TIMEOUT_MS}ms`,
+    });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       log("pnl_api", `HTTP ${res.status} for pool ${poolAddress.slice(0, 8)}: ${body.slice(0, 120)}`);
@@ -533,7 +538,7 @@ export async function getMyPositions({ force = false } = {}) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
-	const mintMaps = await Promise.all(
+    const mintMaps = await Promise.all(
 		uniquePools.map((pool) =>
 			resolvePoolTokenMints({
 				poolAddress: pool,
@@ -541,17 +546,16 @@ export async function getMyPositions({ force = false } = {}) {
 			}),
 		),
 	);
-	const mintLookupFailure = mintMaps.find((entry) => entry?.error);
-	if (mintLookupFailure) {
-		return {
-			wallet: walletAddress,
-			total_positions: 0,
-			positions: [],
-			error: `pool mint enrichment failed: ${mintLookupFailure.error}`,
-		};
-	}
     const mintsByPool = {};
-    uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
+		uniquePools.forEach((pool, i) => {
+			const mintMap = mintMaps[i];
+			if (mintMap?.error) {
+				log("positions_warn", `Pool mint enrichment failed for ${pool.slice(0, 8)}: ${mintMap.error}`);
+				mintsByPool[pool] = null;
+				return;
+			}
+			mintsByPool[pool] = mintMap;
+		});
 
     const positions = raw.map((r) => {
     const p = pnlByPool[r.pool]?.[r.position] || null;
@@ -570,6 +574,10 @@ export async function getMyPositions({ force = false } = {}) {
       const collectedFees = p ? parseFloat(p.allTimeFees?.total?.usd || 0) : 0;
       const pnlUsd        = p?.pnlUsd       ?? 0;
       const pnlPct        = p?.pnlPctChange ?? 0;
+      const observedAtMs = Number.isFinite(Number(p?.observed_at_ms ?? p?.as_of_ms ?? p?.updatedAtMs ?? p?.updated_at_ms))
+        ? Number(p?.observed_at_ms ?? p?.as_of_ms ?? p?.updatedAtMs ?? p?.updated_at_ms)
+        : null;
+      const staleWithoutFreshness = p ? observedAtMs == null : false;
 
       const tracked = getTrackedPosition(r.position);
       const poolMints = mintsByPool[r.pool] || null;
@@ -600,8 +608,11 @@ export async function getMyPositions({ force = false } = {}) {
         active_bin: activeBin,
         in_range: inRange,
 			pnl_missing: pnlMissing,
-			stale: p?.stale === true || p?.status === "stale",
-			status: p?.status || (pnlMissing ? "missing" : "ok"),
+			pnl_error: pnlMissing ? "Position not found in PnL API" : null,
+			stale: p?.stale === true || p?.status === "stale" || staleWithoutFreshness,
+			status: pnlMissing ? "missing" : (p?.status || (staleWithoutFreshness ? "stale" : "ok")),
+			observed_at_ms: observedAtMs,
+			max_age_ms: p ? 60_000 : null,
         out_of_range_direction: oorDirection,
         unclaimed_fees_usd: Math.round(unclaimedFees * 100) / 100,
         total_value_usd: Math.round(totalValue * 100) / 100,
@@ -654,7 +665,7 @@ export async function getWalletPositions({ wallet_address }) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
-	const mintMaps = await Promise.all(
+    const mintMaps = await Promise.all(
 		uniquePools.map((pool) =>
 			resolvePoolTokenMints({
 				poolAddress: pool,
@@ -662,17 +673,16 @@ export async function getWalletPositions({ wallet_address }) {
 			}),
 		),
 	);
-	const mintLookupFailure = mintMaps.find((entry) => entry?.error);
-	if (mintLookupFailure) {
-		return {
-			wallet: wallet_address,
-			total_positions: 0,
-			positions: [],
-			error: `pool mint enrichment failed: ${mintLookupFailure.error}`,
-		};
-	}
     const mintsByPool = {};
-    uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
+		uniquePools.forEach((pool, i) => {
+			const mintMap = mintMaps[i];
+			if (mintMap?.error) {
+				log("wallet_positions_warn", `Pool mint enrichment failed for ${pool.slice(0, 8)}: ${mintMap.error}`);
+				mintsByPool[pool] = null;
+				return;
+			}
+			mintsByPool[pool] = mintMap;
+		});
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
@@ -706,7 +716,10 @@ export async function getWalletPositions({ wallet_address }) {
 // ─── Search Pools by Query ─────────────────────────────────────
 export async function searchPools({ query, limit = 10 }) {
   const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {
+    timeoutMs: DLMM_FETCH_TIMEOUT_MS,
+    timeoutMessage: `Pool search request timed out after ${DLMM_FETCH_TIMEOUT_MS}ms`,
+  });
   if (!res.ok) throw new Error(`Pool search API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
   const pools = (Array.isArray(data) ? data : data.data || []).slice(0, limit);
