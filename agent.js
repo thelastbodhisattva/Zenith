@@ -6,6 +6,7 @@ import { createActionId } from "./cycle-trace.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "rebalance_on_exit", "auto_compound_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_to_blacklist", "get_wallet_balance", "get_my_positions", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers"]);
+const LIVE_STATE_TOOLS = new Set(["get_my_positions", "get_position_pnl", "get_top_candidates", "get_wallet_balance"]);
 const GENERAL_SAFE_TOOLS = new Set([
   "discover_pools",
   "get_top_candidates",
@@ -36,9 +37,18 @@ const GENERAL_SAFE_TOOLS = new Set([
   "list_blacklist",
 ]);
 
-export function getToolsForRole(agentType, { allowDangerousTools = false, dangerousToolScope = null } = {}) {
-  if (agentType === "MANAGER")  return tools.filter(t => MANAGER_TOOLS.has(t.function.name));
-  if (agentType === "SCREENER") return tools.filter(t => SCREENER_TOOLS.has(t.function.name));
+function resolveRoleTools(toolSet, { disableLiveStateTools = false } = {}) {
+  return tools.filter((tool) => {
+    const name = tool.function.name;
+    if (!toolSet.has(name)) return false;
+    if (disableLiveStateTools && LIVE_STATE_TOOLS.has(name)) return false;
+    return true;
+  });
+}
+
+export function getToolsForRole(agentType, { allowDangerousTools = false, dangerousToolScope = null, disableLiveStateTools = false } = {}) {
+  if (agentType === "MANAGER")  return resolveRoleTools(MANAGER_TOOLS, { disableLiveStateTools });
+  if (agentType === "SCREENER") return resolveRoleTools(SCREENER_TOOLS, { disableLiveStateTools });
   if (allowDangerousTools) {
 		const allowedScopedTools = new Set(
 			Array.isArray(dangerousToolScope?.allowed_tools)
@@ -77,6 +87,24 @@ const client = new OpenAI({
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
 
+function getProviderErrorCode(error) {
+  const code = Number(error?.status ?? error?.code ?? error?.error?.status ?? error?.error?.code);
+  return Number.isFinite(code) ? code : null;
+}
+
+export function isTransientProviderError(error) {
+  const code = getProviderErrorCode(error);
+  if (code != null) {
+    return code === 429 || code === 502 || code === 503 || code === 529;
+  }
+  const text = `${error?.name || ""} ${error?.message || error?.error?.message || String(error || "")}`.toLowerCase();
+  return /(timeout|timed out|fetch failed|network|econnreset|enotfound|connection reset|socket hang up|temporar|upstream unavailable|service unavailable|overloaded)/.test(text);
+}
+
+export function parseToolArguments(rawArguments) {
+  return JSON.parse(rawArguments);
+}
+
 /**
  * Core ReAct agent loop.
  *
@@ -85,8 +113,16 @@ const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
+  const executeToolRuntime = options.executeTool || executeTool;
+  const getWalletBalancesRuntime = options.getWalletBalances || getWalletBalances;
+  const getMyPositionsRuntime = options.getMyPositions || getMyPositions;
+  const llmClient = options.llmClient || client;
+
   // Build dynamic system prompt with current portfolio state
-  const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+  const [portfolio, positions] = await Promise.all([
+    options.stateSnapshot?.portfolio != null ? options.stateSnapshot.portfolio : getWalletBalancesRuntime(),
+    options.stateSnapshot?.positions != null ? options.stateSnapshot.positions : getMyPositionsRuntime(),
+  ]);
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
@@ -110,24 +146,43 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
+      let lastProviderError = null;
       for (let attempt = 0; attempt < 3; attempt++) {
-        response = await client.chat.completions.create({
-          model: usedModel,
-          messages,
-          tools: getToolsForRole(agentType, options),
-          tool_choice: "auto",
-          temperature: config.llm.temperature,
-          max_tokens: maxOutputTokens ?? config.llm.maxTokens,
-        });
+        try {
+          response = await llmClient.chat.completions.create({
+            model: usedModel,
+            messages,
+            tools: getToolsForRole(agentType, options),
+            tool_choice: "auto",
+            temperature: config.llm.temperature,
+            max_tokens: maxOutputTokens ?? config.llm.maxTokens,
+          });
+        } catch (providerError) {
+          lastProviderError = providerError;
+          if (!isTransientProviderError(providerError) || attempt === 2) break;
+          const wait = (attempt + 1) * 5000;
+          const errorCode = getProviderErrorCode(providerError) ?? providerError.name ?? "transient";
+          if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
+            usedModel = FALLBACK_MODEL;
+            log("agent", `Transient provider error ${errorCode}; switching to fallback model ${FALLBACK_MODEL}`);
+            continue;
+          }
+          log("agent", `Transient provider error ${errorCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
+          await sleep(wait);
+          continue;
+        }
         if (response.choices?.length) break;
-        const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
+        lastProviderError = response?.error
+          ? new Error(response.error.message || `Provider error ${response.error.code || "unknown"}`)
+          : null;
+        const errCode = getProviderErrorCode(response);
+        if (isTransientProviderError(response) && attempt < 2) {
           const wait = (attempt + 1) * 5000;
           if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
             usedModel = FALLBACK_MODEL;
-            log("agent", `Switching to fallback model ${FALLBACK_MODEL}`);
+            log("agent", `Transient provider error ${errCode ?? "unknown"}; switching to fallback model ${FALLBACK_MODEL}`);
           } else {
-            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
+            log("agent", `Transient provider error ${errCode ?? "unknown"}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
             await new Promise((r) => setTimeout(r, wait));
           }
         } else {
@@ -136,6 +191,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       }
 
       if (!response.choices?.length) {
+        if (lastProviderError) {
+          throw new Error(`LLM provider request failed after retries: ${lastProviderError.message}`);
+        }
         log("error", `Bad API response: ${JSON.stringify(response).slice(0, 200)}`);
         throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
       }
@@ -168,10 +226,19 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       let functionArgs;
 
       try {
-        functionArgs = JSON.parse(toolCall.function.arguments);
+        functionArgs = parseToolArguments(toolCall.function.arguments);
       } catch (parseError) {
-        log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
-        functionArgs = {};
+        const errorMessage = `Invalid tool arguments for ${functionName}: ${parseError.message}`;
+        log("error", `${errorMessage}. Raw args: ${String(toolCall.function.arguments || "")}`);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            error: errorMessage,
+            tool: functionName,
+          }),
+        });
+        continue;
       }
 
       const toolMeta = {};
@@ -183,7 +250,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         toolActionIndex += 1;
       }
 
-      const result = await executeTool(functionName, functionArgs, toolMeta);
+      const result = await executeToolRuntime(functionName, functionArgs, toolMeta);
 
       messages.push({
         role: "tool",
