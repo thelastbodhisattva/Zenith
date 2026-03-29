@@ -33,6 +33,8 @@ Two specialized agents run on independent schedules:
 A third health check runs hourly to summarize portfolio state.
 
 **Current runtime behavior:**
+- Agent-side tool execution is more fault-tolerant: malformed tool-call JSON is repaired before execution, assistant tool-call history is sanitized before replay to the model, and polluted tool names are normalized before dispatch reaches the executor boundary
+- LP Agent consumers now share one bounded client across scoring and overview reads, with shared multi-key quota accounting, 429 retry/backoff, and a common anti-burst delay instead of separate ad hoc fetch paths
 - `tools/dlmm.js` is now narrower: pure DLMM planning, settlement observation, live position-context enrichment, and rebalance/compounding context helpers were split into dedicated modules while keeping the public tool surface stable
 - `tools/executor.js` is now narrower too: lifecycle journaling, post-success side effects, and safety-policy evaluation live behind dedicated helpers so `executeTool()` is closer to a coordinator than a god-function
 - Direct tests now cover screening fail-closed prechecks, runtime-only management cycles, the `/preflight` shell path, and headless Telegram operator ingress instead of relying only on indirect hardening coverage
@@ -99,7 +101,7 @@ Agents are powered via OpenRouter-compatible models and can be swapped by changi
 - [OpenRouter](https://openrouter.ai) API key
 - Solana wallet (base58 private key)
 - Telegram bot token (optional, for notifications)
-- `LPAGENT_API_KEY` (optional, enables `score_top_lpers` / top-LPer scoring features when available)
+- `LPAGENT_API_KEY` (optional, enables `score_top_lpers` / top-LPer scoring features when available; comma-separated keys are supported for shared rotation/backoff)
 - `JUPITER_API_KEY` (optional, used for authenticated Jupiter swap/quote requests when available)
 
 ---
@@ -126,7 +128,7 @@ OPENROUTER_API_KEY=sk-or-...
 WALLET_PRIVATE_KEY=your_base58_private_key
 HELIUS_API_KEY=your_helius_key         # optional for some wallet/balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...       # optional
-LPAGENT_API_KEY=lpagent_...            # optional, enables score_top_lpers when available
+LPAGENT_API_KEY=lpagent_a,lpagent_b    # optional, enables LP-agent scoring/overview with shared key rotation when available
 JUPITER_API_KEY=jup_...                # optional, adds authenticated Jupiter API access when available
 DRY_RUN=true                           # safest way to start
 ```

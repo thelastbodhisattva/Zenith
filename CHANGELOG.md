@@ -6,6 +6,9 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-29
 
+- Ported Meridian agent-boundary hardening so malformed tool-call JSON is repaired before execution, assistant tool-call history is sanitized before replay, and polluted tool names are normalized before dispatch/safety checks/logging.
+- Ported shared LP Agent throttling across `tools/study.js` and `tools/lp-overview.js`, with shared multi-key rotation, per-key quota accounting, bounded anti-burst spacing, and 429 retry/backoff.
+- Added direct regression coverage for repaired tool JSON/history handling, normalized executor dispatch, and shared LP Agent retry/key reuse across study and overview flows.
 - Added explicit scoped GENERAL write approvals and persisted recovery resume overrides: `/arm` now requires `tool=...` scope and supports `pool=`, `position=`, `max_sol`, and `once`, while `/resume <why>` only clears the matching unresolved-workflow manual-review suppression incident and leaves portfolio guard pauses intact.
 - Added `/preflight` as a persisted risk-opening check for manual deploy actions, with recorded approval matching and stable validation/runbook reasons enforced at the executor boundary.
 - Hardened screening so startup-precheck failures and invalid regime-state persistence fail closed before model invocation, and adaptive sizing now skips new deployment when the resulting size falls below the required SOL floor.
